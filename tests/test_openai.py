@@ -48,19 +48,30 @@ class Handler(BaseHTTPRequestHandler):
                 "enable_thinking": False
             }
             assert request["response_format"]["type"] == "json_schema"
-            response = {
-                "choices": [{
-                    "message": {"content": json.dumps({
-                        "class": "COMPLEX", "detail": "NORMAL",
-                        "mode": "PLAN", "task": "DEBUG",
-                    })},
-                    "finish_reason": "stop",
-                }],
-                "usage": {
-                    "prompt_tokens": 13, "completion_tokens": 7,
-                    "completion_tokens_details": {"reasoning_tokens": 0},
-                },
-            }
+            schema = request["response_format"]["json_schema"]["schema"]
+            if "output" in schema["properties"]:
+                assert "NOOP" in schema["properties"]["output"]["pattern"]
+                response = {
+                    "choices": [{"message": {"content": json.dumps(
+                        {"output": "NOOP\n"})}, "finish_reason": "stop"}],
+                    # LM Studio does not guarantee reasoning usage on every
+                    # valid structured-output response.
+                    "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+                }
+            else:
+                response = {
+                    "choices": [{
+                        "message": {"content": json.dumps({
+                            "class": "COMPLEX", "detail": "NORMAL",
+                            "mode": "PLAN", "task": "DEBUG",
+                        })},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {
+                        "prompt_tokens": 13, "completion_tokens": 7,
+                        "completion_tokens_details": {"reasoning_tokens": 0},
+                    },
+                }
         elif self.path == "/v1/chat/completions" and request["model"] == "vllm-model":
             assert request["reasoning_effort"] == "none"
             assert request["response_format"]["type"] == "json_schema"

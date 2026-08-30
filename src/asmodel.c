@@ -323,6 +323,7 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
   model_slot *s;
   asmodel_err e;
   int rc;
+  char detail[384] = {0};
   if (!m || !id || !params || !out_text) return ASMODEL_ERR_INVALID;
   *out_text = NULL;
   e = begin_call(m, id, &s);
@@ -331,12 +332,19 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
       s->provider.generate(s->provider.userdata, sys, user, grammar, params,
                            token_fn, token_ud, cancel, out_text, out_in, out_gen)
       : -1;
+  if (rc != ASMODEL_OK && s->provider.last_error) {
+    const char *provider_error = s->provider.last_error(s->provider.userdata);
+    if (provider_error && provider_error[0])
+      snprintf(detail, sizeof detail, "%s", provider_error);
+  }
   end_call(m, s);
   if (cancel && *cancel) return ASMODEL_ERR_CANCELLED;
   if (rc == ASMODEL_OK) return ASMODEL_OK;
   if (rc >= ASMODEL_ERR_INVALID && rc <= ASMODEL_ERR_TIMEOUT)
-    return seterr(m, (asmodel_err)rc, "generation failed for '%s'", id);
-  return seterr(m, ASMODEL_ERR_BACKEND, "generation failed for '%s'", id);
+    return seterr(m, (asmodel_err)rc, "generation failed for '%s'%s%s", id,
+                  detail[0] ? ": " : "", detail);
+  return seterr(m, ASMODEL_ERR_BACKEND, "generation failed for '%s'%s%s", id,
+                detail[0] ? ": " : "", detail);
 }
 
 asmodel_err asmodel_embed(asmodel_manager *m, const char *id,
@@ -423,7 +431,7 @@ int asmodel_remote_capabilities(asmodel_remote_provider provider,
     name = "lmstudio";
     profile = "lmstudio-schema-v1";
     flags |= ASMODEL_CAP_JSON_SCHEMA | ASMODEL_CAP_ACTION_SCHEMA |
-             ASMODEL_CAP_REASONING_OFF | ASMODEL_CAP_USAGE_REASONING;
+             ASMODEL_CAP_REASONING_OFF;
     break;
   case ASMODEL_REMOTE_VLLM:
     name = "vllm";

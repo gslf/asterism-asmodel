@@ -31,6 +31,16 @@ int main(int argc, char **argv) {
   const char *classify_grammar =
       "root ::= \"CLASS \" class \" | DETAIL \" detail "
       "\" | MODE \" mode \" | TASK \" task \"\\n\"\n";
+  const char *curation_grammar =
+      "root ::= noop | opline+\n"
+      "opline ::= insert | update | deprecate\n"
+      "noop ::= \"NOOP\" \"\\n\"\n"
+      "insert ::= \"INSERT \" (\"identity\" | \"context\" | \"project\") "
+      "\" | \" text \"\\n\"\n"
+      "update ::= \"UPDATE \" handle \" | \" text \"\\n\"\n"
+      "deprecate ::= \"DEPRECATE \" handle \" | \" text \"\\n\"\n"
+      "handle ::= \"M1\" | \"M2\"\n"
+      "text ::= [^|\\n\\r]+\n";
   char error[256] = {0}, *text = NULL;
   int prompt_tokens = 0, generated_tokens = 0;
   float vector[3] = {0};
@@ -137,6 +147,17 @@ int main(int argc, char **argv) {
       !(info.applied & ASMODEL_APPLIED_CONSTRAINT) ||
       info.reasoning_tokens != 0)
     return 11;
+
+  /* LM Studio cannot consume arbitrary GBNF. The adapter translates the
+   * Asper line protocol to JSON Schema and unwraps its output field back to
+   * the exact text expected by Asper. Reasoning usage is optional here. */
+  text = NULL;
+  if (lmstudio.generate(lmstudio.userdata, "system", "user",
+                        curation_grammar, &params, NULL, NULL, NULL,
+                        &text, &prompt_tokens, &generated_tokens) !=
+          ASMODEL_OK || !text || strcmp(text, "NOOP\n") != 0)
+    return 22;
+  free(text);
 
   spec.remote_provider = ASMODEL_REMOTE_VLLM;
   spec.remote_model = "vllm-model";

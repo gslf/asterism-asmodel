@@ -32,7 +32,10 @@ typedef enum {
   SCHEMA_NONE = 0,
   SCHEMA_STEP,
   SCHEMA_CLASSIFY,
-  SCHEMA_JUDGE
+  SCHEMA_JUDGE,
+  SCHEMA_ASPER_CURATION,
+  SCHEMA_ASPER_REVIEW,
+  SCHEMA_ASPER_RECALL
 } schema_kind;
 
 static char *odup(const char *s) {
@@ -430,6 +433,14 @@ static schema_kind schema_for_grammar(const char *grammar) {
     return SCHEMA_CLASSIFY;
   if (strstr(grammar, "root ::= \"SCORE \"") != NULL)
     return SCHEMA_JUDGE;
+  if (strstr(grammar, "root ::= noop | opline+") != NULL)
+    return SCHEMA_ASPER_CURATION;
+  if (strstr(grammar, "root ::= noop | revline+") != NULL ||
+      (strstr(grammar, "root ::= noop\n") != NULL &&
+       strstr(grammar, "noop ::= \"NOOP\"") != NULL))
+    return SCHEMA_ASPER_REVIEW;
+  if (strstr(grammar, "root ::= nomem |") != NULL)
+    return SCHEMA_ASPER_RECALL;
   return SCHEMA_NONE;
 }
 
@@ -580,6 +591,74 @@ static int append_step_schema(bytes *b, const char *grammar, int draft_mode) {
   return putsb(b, "]}");
 }
 
+static int append_asper_handles(bytes *b, const char *grammar) {
+  const char *p = strstr(grammar, "handle ::= ");
+  const char *end;
+  int first = 1;
+  if (!p) return -1;
+  end = strchr(p, '\n');
+  if (!end) end = p + strlen(p);
+  if (putsb(b, "(")) return -1;
+  while ((p = strchr(p, '"')) != NULL && p < end) {
+    const char *q = strchr(++p, '"');
+    if (!q || q > end) return -1;
+    if ((!first && putsb(b, "|")) || putn(b, p, (size_t)(q - p))) return -1;
+    first = 0;
+    p = q + 1;
+  }
+  return first ? -1 : putsb(b, ")");
+}
+
+static int append_asper_pattern(bytes *b, schema_kind kind,
+                                const char *grammar) {
+  int handles = strstr(grammar, "handle ::= ") != NULL;
+  if (kind == SCHEMA_ASPER_CURATION) {
+    if (putsb(b, "^(NOOP\\n|((INSERT (identity|context|project) \\| "
+                 "[^|\\n\\r]+")) return -1;
+    if (handles) {
+      if (putsb(b, "|(UPDATE|DEPRECATE) ") ||
+          append_asper_handles(b, grammar) ||
+          putsb(b, " \\| [^|\\n\\r]+")) return -1;
+    }
+    return putsb(b, ")\\n)+)$");
+  }
+  if (kind == SCHEMA_ASPER_REVIEW) {
+    if (!handles) return putsb(b, "^NOOP\\n$");
+    if (putsb(b, "^(NOOP\\n|((DEPRECATE ") ||
+        append_asper_handles(b, grammar) ||
+        putsb(b, " \\| [^|\\n\\r]+|KEEP ") ||
+        append_asper_handles(b, grammar) ||
+        putsb(b, ")\\n)+)$")) return -1;
+    return 0;
+  }
+  if (kind == SCHEMA_ASPER_RECALL) {
+    if (putsb(b, "^(NOMEM\\n|ANSWER \\| [^|\\n\\r]+\\n")) return -1;
+    if (handles) {
+      if (putsb(b, "(CITE ") || append_asper_handles(b, grammar) ||
+          putsb(b, "\\n)*")) return -1;
+    }
+    return putsb(b, ")$");
+  }
+  return -1;
+}
+
+static int append_asper_schema(bytes *b, schema_kind kind,
+                               const char *grammar) {
+  bytes pattern = {0};
+  int rc = -1;
+  if (append_asper_pattern(&pattern, kind, grammar)) goto done;
+  if (putsb(b, "{\"type\":\"object\",\"properties\":{"
+               "\"output\":{\"type\":\"string\",\"minLength\":5,"
+               "\"maxLength\":32768,\"pattern\":")) goto done;
+  if (json_string(b, pattern.p) ||
+      putsb(b, "}},\"required\":[\"output\"],"
+               "\"additionalProperties\":false}")) goto done;
+  rc = 0;
+done:
+  free(pattern.p);
+  return rc;
+}
+
 static int append_schema(bytes *body, schema_kind kind, const char *grammar,
                          int draft_mode) {
   if (kind == SCHEMA_STEP) {
@@ -600,6 +679,10 @@ static int append_schema(bytes *body, schema_kind kind, const char *grammar,
         "\"critique\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512}},"
         "\"required\":[\"score\",\"critique\"],"
         "\"additionalProperties\":false}")) return -1;
+  } else if (kind == SCHEMA_ASPER_CURATION ||
+             kind == SCHEMA_ASPER_REVIEW ||
+             kind == SCHEMA_ASPER_RECALL) {
+    if (append_asper_schema(body, kind, grammar)) return -1;
   } else {
     return -1;
   }
@@ -774,6 +857,10 @@ static char *normalize_schema_json(schema_kind kind, const char *json,
   const char *score_p;
   int score;
   if (kind == SCHEMA_STEP) return normalize_step_json(json, draft_mode);
+  if (kind == SCHEMA_ASPER_CURATION ||
+      kind == SCHEMA_ASPER_REVIEW ||
+      kind == SCHEMA_ASPER_RECALL)
+    return json_value_string(json, "output");
   if (kind == SCHEMA_CLASSIFY) {
     a = json_value_string(json, "class");
     d = json_value_string(json, "detail");
