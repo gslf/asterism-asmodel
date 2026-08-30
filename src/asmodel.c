@@ -34,8 +34,7 @@ static int64_t mono_ms(void) {
 typedef struct {
   asmodel_spec spec;
   char id[ASMODEL_ID_MAX];
-  char *path, *base_url, *remote_model, *api_key_env, *api_grammar;
-  char *reasoning_effort;
+  char *path, *base_url, *remote_model, *api_key_env;
   asmodel_provider provider;
   asm_mutex call_mu;
   int resident, in_use;
@@ -146,7 +145,7 @@ static asmodel_err ensure_loaded(asmodel_manager *m, model_slot *s) {
   return ASMODEL_OK;
 }
 
-const char *asmodel_version(void) { return "0.1.0"; }
+const char *asmodel_version(void) { return "0.2.0"; }
 
 const char *asmodel_err_name(asmodel_err e) {
   switch (e) {
@@ -157,7 +156,9 @@ const char *asmodel_err_name(asmodel_err e) {
     case ASMODEL_ERR_BUSY: return "ASMODEL_ERR_BUSY";
     case ASMODEL_ERR_LIMIT: return "ASMODEL_ERR_LIMIT";
     case ASMODEL_ERR_BACKEND: return "ASMODEL_ERR_BACKEND";
+    case ASMODEL_ERR_UNSUPPORTED: return "ASMODEL_ERR_UNSUPPORTED";
     case ASMODEL_ERR_CANCELLED: return "ASMODEL_ERR_CANCELLED";
+    case ASMODEL_ERR_TIMEOUT: return "ASMODEL_ERR_TIMEOUT";
     default: return "ASMODEL_ERR_UNKNOWN";
   }
 }
@@ -187,7 +188,7 @@ void asmodel_manager_destroy(asmodel_manager *m) {
     unload_slot(s);
     mu_drop(&s->call_mu);
     free(s->path); free(s->base_url); free(s->remote_model);
-    free(s->api_key_env); free(s->api_grammar); free(s->reasoning_effort);
+    free(s->api_key_env);
   }
   free(m->slots);
   mu_unlock(&m->mu);
@@ -227,15 +228,11 @@ asmodel_err asmodel_manager_register(asmodel_manager *m,
   s->base_url = dupstr(spec->base_url);
   s->remote_model = dupstr(spec->remote_model);
   s->api_key_env = dupstr(spec->api_key_env);
-  s->api_grammar = dupstr(spec->api_grammar);
-  s->reasoning_effort = dupstr(spec->reasoning_effort);
   if ((spec->path && !s->path) || (spec->base_url && !s->base_url) ||
       (spec->remote_model && !s->remote_model) ||
-      (spec->api_key_env && !s->api_key_env) ||
-      (spec->api_grammar && !s->api_grammar) ||
-      (spec->reasoning_effort && !s->reasoning_effort)) {
+      (spec->api_key_env && !s->api_key_env)) {
     free(s->path); free(s->base_url); free(s->remote_model);
-    free(s->api_key_env); free(s->api_grammar); free(s->reasoning_effort);
+    free(s->api_key_env);
     mu_unlock(&m->mu);
     return ASMODEL_ERR_NOMEM;
   }
@@ -243,8 +240,6 @@ asmodel_err asmodel_manager_register(asmodel_manager *m,
   s->spec.id = s->id; s->spec.path = s->path;
   s->spec.base_url = s->base_url; s->spec.remote_model = s->remote_model;
   s->spec.api_key_env = s->api_key_env;
-  s->spec.api_grammar = s->api_grammar;
-  s->spec.reasoning_effort = s->reasoning_effort;
   mu_init(&s->call_mu);
   m->slots_n++;
   mu_unlock(&m->mu);
@@ -338,8 +333,10 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
       : -1;
   end_call(m, s);
   if (cancel && *cancel) return ASMODEL_ERR_CANCELLED;
-  return rc == 0 ? ASMODEL_OK : seterr(m, ASMODEL_ERR_BACKEND,
-                                      "generation failed for '%s'", id);
+  if (rc == ASMODEL_OK) return ASMODEL_OK;
+  if (rc >= ASMODEL_ERR_INVALID && rc <= ASMODEL_ERR_TIMEOUT)
+    return seterr(m, (asmodel_err)rc, "generation failed for '%s'", id);
+  return seterr(m, ASMODEL_ERR_BACKEND, "generation failed for '%s'", id);
 }
 
 asmodel_err asmodel_embed(asmodel_manager *m, const char *id,
@@ -387,6 +384,99 @@ int asmodel_count_prompt_tokens(asmodel_manager *m, const char *id,
   else n = -1;
   end_call(m, s);
   return n;
+}
+
+int asmodel_provider_capabilities(const asmodel_provider *provider,
+                                  asmodel_capabilities *out) {
+  if (!provider || !out) return -1;
+  memset(out, 0, sizeof *out);
+  return provider->capabilities
+             ? provider->capabilities(provider->userdata, out)
+             : -1;
+}
+
+int asmodel_provider_last_generation_info(const asmodel_provider *provider,
+                                          asmodel_generation_info *out) {
+  if (!provider || !out) return -1;
+  memset(out, 0, sizeof *out);
+  return provider->last_generation_info
+             ? provider->last_generation_info(provider->userdata, out)
+             : -1;
+}
+
+int asmodel_remote_capabilities(asmodel_remote_provider provider,
+                                int context_tokens, int embedding,
+                                asmodel_capabilities *out) {
+  uint64_t flags = ASMODEL_CAP_TEXT;
+  const char *name = "openai-compatible";
+  const char *profile = "generic-v1";
+  if (!out) return -1;
+  switch (provider) {
+  case ASMODEL_REMOTE_LLAMA_SERVER:
+    name = "llama-server";
+    profile = "llama-chat-v1";
+    flags |= ASMODEL_CAP_GBNF | ASMODEL_CAP_JSON_SCHEMA |
+             ASMODEL_CAP_ACTION_SCHEMA | ASMODEL_CAP_REASONING_OFF |
+             ASMODEL_CAP_PREFIX_CACHE;
+    break;
+  case ASMODEL_REMOTE_LMSTUDIO:
+    name = "lmstudio";
+    profile = "lmstudio-schema-v1";
+    flags |= ASMODEL_CAP_JSON_SCHEMA | ASMODEL_CAP_ACTION_SCHEMA |
+             ASMODEL_CAP_REASONING_OFF | ASMODEL_CAP_USAGE_REASONING;
+    break;
+  case ASMODEL_REMOTE_VLLM:
+    name = "vllm";
+    profile = "vllm-structured-v1";
+    flags |= ASMODEL_CAP_GBNF | ASMODEL_CAP_JSON_SCHEMA |
+             ASMODEL_CAP_ACTION_SCHEMA | ASMODEL_CAP_REASONING_OFF |
+             ASMODEL_CAP_USAGE_REASONING;
+    break;
+  case ASMODEL_REMOTE_AUTO:
+  case ASMODEL_REMOTE_GENERIC:
+    provider = ASMODEL_REMOTE_GENERIC;
+    break;
+  default:
+    return -1;
+  }
+  if (embedding) flags |= ASMODEL_CAP_EMBEDDINGS;
+  memset(out, 0, sizeof *out);
+  out->remote_provider = provider;
+  out->flags = flags;
+  out->context_tokens = context_tokens;
+  snprintf(out->provider, sizeof out->provider, "%s", name);
+  snprintf(out->profile, sizeof out->profile, "%s", profile);
+  return 0;
+}
+
+asmodel_err asmodel_manager_capabilities(asmodel_manager *m, const char *id,
+                                         asmodel_capabilities *out) {
+  model_slot *s;
+  asmodel_err e;
+  int rc;
+  if (!m || !id || !out) return ASMODEL_ERR_INVALID;
+  e = begin_call(m, id, &s);
+  if (e != ASMODEL_OK) return e;
+  rc = asmodel_provider_capabilities(&s->provider, out);
+  end_call(m, s);
+  return rc == 0 ? ASMODEL_OK
+                 : seterr(m, ASMODEL_ERR_UNSUPPORTED,
+                          "model '%s' does not expose capabilities", id);
+}
+
+asmodel_err asmodel_manager_last_generation_info(
+    asmodel_manager *m, const char *id, asmodel_generation_info *out) {
+  model_slot *s;
+  asmodel_err e;
+  int rc;
+  if (!m || !id || !out) return ASMODEL_ERR_INVALID;
+  e = begin_call(m, id, &s);
+  if (e != ASMODEL_OK) return e;
+  rc = asmodel_provider_last_generation_info(&s->provider, out);
+  end_call(m, s);
+  return rc == 0 ? ASMODEL_OK
+                 : seterr(m, ASMODEL_ERR_UNSUPPORTED,
+                          "model '%s' does not expose generation metadata", id);
 }
 
 size_t asmodel_manager_stats(asmodel_manager *m, asmodel_model_stats *out,

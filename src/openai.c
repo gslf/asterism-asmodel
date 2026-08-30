@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +18,10 @@
 #endif
 
 typedef struct {
-  char *base_url, *model, *api_key_env, *grammar_mode, *reasoning_effort;
+  char *base_url, *model, *api_key_env;
+  asmodel_remote_provider remote_provider;
+  asmodel_capabilities caps;
+  asmodel_generation_info last_generation;
   int embedding, dim;
   char last_error[512];
 } oai_provider;
@@ -83,15 +87,27 @@ static int json_string(bytes *b, const char *s) {
 }
 
 #ifdef ASMODEL_WITH_CURL
+typedef struct {
+  bytes *reply;
+  asmodel_token_fn progress_fn;
+  void *progress_ud;
+} write_ud;
+
 static size_t curl_write(char *ptr, size_t sz, size_t nm, void *ud) {
-  bytes *b = (bytes *)ud;
+  write_ud *w = (write_ud *)ud;
   size_t n = sz * nm;
-  return putn(b, ptr, n) == 0 ? n : 0;
+  if (putn(w->reply, ptr, n) != 0) return 0;
+  /* A zero-length callback is an out-of-band progress heartbeat.  It keeps
+   * a supervising runtime informed during reasoning without exposing
+   * reasoning text as assistant output. */
+  if (n > 0 && w->progress_fn)
+    w->progress_fn("", 0, w->progress_ud);
+  return n;
 }
-typedef struct { volatile int *cancel; } progress_ud;
+typedef struct { volatile int *cancel; } cancel_ud;
 static int curl_progress(void *ud, curl_off_t a, curl_off_t b,
                          curl_off_t c, curl_off_t d) {
-  progress_ud *p = (progress_ud *)ud;
+  cancel_ud *p = (cancel_ud *)ud;
   (void)a; (void)b; (void)c; (void)d;
   return p->cancel && *p->cancel ? 1 : 0;
 }
@@ -111,6 +127,8 @@ static int endpoint(const char *base, const char *suffix, char **out) {
 
 static int post_json(oai_provider *u, const char *suffix, const char *body,
                      volatile int *cancel, bytes *reply,
+                     asmodel_token_fn progress_fn, void *progress_ud,
+                     int64_t deadline_ms,
                      char *error, size_t error_size) {
 #ifdef ASMODEL_WITH_CURL
   CURL *curl = NULL;
@@ -119,7 +137,8 @@ static int post_json(oai_provider *u, const char *suffix, const char *body,
   const char *key = NULL;
   CURLcode cc;
   long status = 0;
-  progress_ud prog;
+  cancel_ud prog;
+  write_ud writer;
   int rc = -1;
   if (endpoint(u->base_url, suffix, &url)) goto done;
   curl = curl_easy_init();
@@ -139,20 +158,36 @@ static int post_json(oai_provider *u, const char *suffix, const char *body,
     headers = curl_slist_append(headers, auth);
   }
   prog.cancel = cancel;
+  writer.reply = reply;
+  writer.progress_fn = progress_fn;
+  writer.progress_ud = progress_ud;
   curl_easy_setopt(curl, CURLOPT_URL, url);
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, reply);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &writer);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 600000L);
+  if (deadline_ms > 0) {
+    long timeout = deadline_ms > LONG_MAX ? LONG_MAX : (long)deadline_ms;
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout);
+  }
   curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
   curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_progress);
   curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &prog);
   cc = curl_easy_perform(curl);
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
   if (cc != CURLE_OK) {
-    snprintf(error, error_size, "HTTP transport: %s", curl_easy_strerror(cc));
+    if (cc == CURLE_OPERATION_TIMEDOUT && deadline_ms > 0) {
+      snprintf(error, error_size,
+               "inference deadline expired after %lld ms",
+               (long long)deadline_ms);
+      rc = -2;
+    } else {
+      snprintf(error, error_size, "HTTP transport: %s",
+               curl_easy_strerror(cc));
+    }
   } else if (status < 200 || status >= 300) {
     snprintf(error, error_size, "HTTP %ld: %.160s", status,
              reply->p ? reply->p : "");
@@ -182,10 +217,17 @@ done:
   parts.dwUrlPathLength = (DWORD)-1;
   parts.dwExtraInfoLength = (DWORD)-1;
   if (!WinHttpCrackUrl(wurl, 0, 0, &parts)) goto done;
-  session = WinHttpOpen(L"asmodel/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+  session = WinHttpOpen(L"asmodel/0.2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session) goto done;
-  WinHttpSetTimeouts(session, 10000, 10000, 600000, 600000);
+  {
+    int request_timeout = deadline_ms > 0
+                              ? (deadline_ms > INT_MAX ? INT_MAX
+                                                       : (int)deadline_ms)
+                              : 0;
+    WinHttpSetTimeouts(session, 10000, 10000,
+                       request_timeout, request_timeout);
+  }
   {
     wchar_t *host = (wchar_t *)malloc(((size_t)parts.dwHostNameLength + 1) *
                                       sizeof *host);
@@ -254,6 +296,7 @@ done:
     if (!chunk) goto done;
     if (!WinHttpReadData(request, chunk, available, &got) ||
         putn(reply, chunk, got)) { free(chunk); goto done; }
+    if (got > 0 && progress_fn) progress_fn("", 0, progress_ud);
     free(chunk);
   } while (available);
   if (status < 200 || status >= 300) {
@@ -261,9 +304,18 @@ done:
              reply->p ? reply->p : "");
   } else rc = 0;
 done:
-  if (rc != 0 && error && error_size && !error[0])
-    snprintf(error, error_size, "WinHTTP transport error %lu",
-             (unsigned long)GetLastError());
+  if (rc != 0 && error && error_size && !error[0]) {
+    DWORD winerr = GetLastError();
+    if (winerr == ERROR_WINHTTP_TIMEOUT && deadline_ms > 0) {
+      snprintf(error, error_size,
+               "inference deadline expired after %lld ms",
+               (long long)deadline_ms);
+      rc = -2;
+    } else {
+      snprintf(error, error_size, "WinHTTP transport error %lu",
+               (unsigned long)winerr);
+    }
+  }
   if (request) WinHttpCloseHandle(request);
   if (connection) WinHttpCloseHandle(connection);
   if (session) WinHttpCloseHandle(session);
@@ -528,12 +580,8 @@ static int append_step_schema(bytes *b, const char *grammar, int draft_mode) {
   return putsb(b, "]}");
 }
 
-static int append_response_format(bytes *body, schema_kind kind,
-                                  const char *grammar, int draft_mode) {
-  if (putsb(body, ",\"response_format\":{\"type\":\"json_schema\"," 
-                  "\"json_schema\":{\"name\":\"asmodel_constrained\"," 
-                  "\"strict\":true,\"schema\":"))
-    return -1;
+static int append_schema(bytes *body, schema_kind kind, const char *grammar,
+                         int draft_mode) {
   if (kind == SCHEMA_STEP) {
     if (append_step_schema(body, grammar, draft_mode)) return -1;
   } else if (kind == SCHEMA_CLASSIFY) {
@@ -555,6 +603,16 @@ static int append_response_format(bytes *body, schema_kind kind,
   } else {
     return -1;
   }
+  return 0;
+}
+
+static int append_response_format(bytes *body, schema_kind kind,
+                                  const char *grammar, int draft_mode) {
+  if (putsb(body, ",\"response_format\":{\"type\":\"json_schema\","
+                  "\"json_schema\":{\"name\":\"asmodel_constrained\","
+                  "\"strict\":true,\"schema\":"))
+    return -1;
+  if (append_schema(body, kind, grammar, draft_mode)) return -1;
   return putsb(body, "}}");
 }
 
@@ -753,6 +811,248 @@ fail:
   return NULL;
 }
 
+/* Convert an OpenAI Chat Completions SSE stream into the ordinary response
+ * shape consumed by the decoder below.  Keeping one decoder for streamed and
+ * non-streamed calls prevents provider-specific output validation drift. */
+static int chat_sse_response(const char *sse, bytes *response) {
+  const char *line = sse;
+  bytes content = {0};
+  char *finish = NULL;
+  int prompt_tokens = 0, completion_tokens = 0;
+  int reasoning_tokens = 0, cached_tokens = 0;
+  int have_prompt = 0, have_completion = 0;
+  int have_reasoning = 0, have_cached = 0;
+  int saw_event = 0, saw_choice = 0;
+  int rc = -1;
+
+  while (line && *line) {
+    const char *end = strchr(line, '\n');
+    const char *data, *data_end;
+    size_t line_n = end ? (size_t)(end - line) : strlen(line);
+    if (line_n > 0 && line[line_n - 1] == '\r') line_n--;
+    if (line_n < 5 || memcmp(line, "data:", 5) != 0) {
+      line = end ? end + 1 : NULL;
+      continue;
+    }
+    data = line + 5;
+    data_end = line + line_n;
+    while (data < data_end && (*data == ' ' || *data == '\t')) data++;
+    while (data_end > data &&
+           (data_end[-1] == ' ' || data_end[-1] == '\t')) data_end--;
+    if ((size_t)(data_end - data) == 6 && memcmp(data, "[DONE]", 6) == 0) {
+      line = end ? end + 1 : NULL;
+      continue;
+    }
+    if (data < data_end) {
+      size_t n = (size_t)(data_end - data);
+      char *chunk = (char *)malloc(n + 1);
+      char *delta = NULL, *piece = NULL, *next_finish = NULL;
+      const char *value;
+      if (!chunk) goto done;
+      memcpy(chunk, data, n);
+      chunk[n] = '\0';
+      saw_event = 1;
+
+      delta = json_value_object(chunk, "delta");
+      if (delta) {
+        saw_choice = 1;
+        value = find_key(delta, "content");
+        if (value) piece = decode_json_string(value);
+        if (piece && putsb(&content, piece)) {
+          free(piece); free(delta); free(chunk);
+          goto done;
+        }
+      }
+      next_finish = json_value_string(chunk, "finish_reason");
+      if (next_finish) {
+        saw_choice = 1;
+        free(finish);
+        finish = next_finish;
+      }
+      value = find_key(chunk, "prompt_tokens");
+      if (value) { prompt_tokens = (int)strtol(value, NULL, 10); have_prompt = 1; }
+      value = find_key(chunk, "completion_tokens");
+      if (value) {
+        completion_tokens = (int)strtol(value, NULL, 10);
+        have_completion = 1;
+      }
+      value = find_key(chunk, "reasoning_tokens");
+      if (value) {
+        reasoning_tokens = (int)strtol(value, NULL, 10);
+        have_reasoning = 1;
+      }
+      value = find_key(chunk, "cached_tokens");
+      if (value) { cached_tokens = (int)strtol(value, NULL, 10); have_cached = 1; }
+      free(piece);
+      free(delta);
+      free(chunk);
+    }
+    line = end ? end + 1 : NULL;
+  }
+  if (!saw_event || !saw_choice) goto done;
+  if (!content.p && putsb(&content, "")) goto done;
+  if (putsb(response, "{\"choices\":[{\"message\":{\"content\":" ) ||
+      json_string(response, content.p) ||
+      putsb(response, "},\"finish_reason\":" ) ||
+      json_string(response, finish ? finish : "stop") ||
+      putsb(response, "}],\"usage\":{"))
+    goto done;
+  if (have_prompt) {
+    char n[48];
+    snprintf(n, sizeof n, "\"prompt_tokens\":%d", prompt_tokens);
+    if (putsb(response, n)) goto done;
+  }
+  if (have_completion) {
+    char n[64];
+    snprintf(n, sizeof n, "%s\"completion_tokens\":%d",
+             have_prompt ? "," : "", completion_tokens);
+    if (putsb(response, n)) goto done;
+  }
+  if (have_reasoning) {
+    char n[96];
+    snprintf(n, sizeof n,
+             "%s\"completion_tokens_details\":{\"reasoning_tokens\":%d}",
+             (have_prompt || have_completion) ? "," : "", reasoning_tokens);
+    if (putsb(response, n)) goto done;
+  }
+  if (have_cached) {
+    char n[96];
+    snprintf(n, sizeof n,
+             "%s\"prompt_tokens_details\":{\"cached_tokens\":%d}",
+             (have_prompt || have_completion || have_reasoning) ? "," : "",
+             cached_tokens);
+    if (putsb(response, n)) goto done;
+  }
+  if (putsb(response, "}}")) goto done;
+  rc = 0;
+done:
+  free(content.p);
+  free(finish);
+  return rc;
+}
+
+static asmodel_reasoning_mode effective_reasoning(
+    const oai_provider *u, const asmodel_generate_params *params) {
+  (void)u;
+  return params->reasoning;
+}
+
+static int append_reasoning_chat(bytes *body, oai_provider *u,
+                                 asmodel_reasoning_mode mode,
+                                 int budget) {
+  if (mode == ASMODEL_REASONING_DEFAULT) return 0;
+  if (mode == ASMODEL_REASONING_REQUIRED_OFF) {
+    if (!(u->caps.flags & ASMODEL_CAP_REASONING_OFF)) return -1;
+    if (putsb(body, ",\"reasoning_effort\":\"none\"")) return -1;
+    /* LM Studio forwards llama.cpp chat-template kwargs.  Some models ignore
+     * reasoning_effort but honor enable_thinking, so send both controls and
+     * verify the actual reasoning count when the server reports it. */
+    if (u->remote_provider == ASMODEL_REMOTE_LMSTUDIO &&
+        putsb(body,
+              ",\"chat_template_kwargs\":{\"enable_thinking\":false}"))
+      return -1;
+    u->last_generation.applied |= ASMODEL_APPLIED_REASONING_OFF;
+    return 0;
+  }
+  if (mode == ASMODEL_REASONING_REQUIRED_ON) {
+    if (!(u->caps.flags & ASMODEL_CAP_REASONING_ON)) return -1;
+    if (putsb(body, ",\"reasoning_effort\":\"medium\"")) return -1;
+    if (u->remote_provider == ASMODEL_REMOTE_LMSTUDIO &&
+        putsb(body,
+              ",\"chat_template_kwargs\":{\"enable_thinking\":true}"))
+      return -1;
+    u->last_generation.applied |= ASMODEL_APPLIED_REASONING_ON;
+    return 0;
+  }
+  if (!(u->caps.flags & ASMODEL_CAP_REASONING_BUDGET) || budget <= 0)
+    return -1;
+  if (putsb(body, ",\"reasoning_effort\":\"medium\"")) return -1;
+  {
+    char n[64];
+    const char *key = u->remote_provider == ASMODEL_REMOTE_VLLM
+                          ? "thinking_token_budget"
+                          : "reasoning_budget";
+    snprintf(n, sizeof n, ",\"%s\":%d", key, budget);
+    if (putsb(body, n)) return -1;
+  }
+  u->last_generation.applied |= ASMODEL_APPLIED_REASONING_ON;
+  return 0;
+}
+
+static int append_reasoning_responses(bytes *body, oai_provider *u,
+                                      asmodel_reasoning_mode mode,
+                                      int budget) {
+  const char *effort;
+  if (mode == ASMODEL_REASONING_DEFAULT) return 0;
+  if (mode == ASMODEL_REASONING_REQUIRED_OFF) {
+    if (!(u->caps.flags & ASMODEL_CAP_REASONING_OFF)) return -1;
+    effort = "none";
+    u->last_generation.applied |= ASMODEL_APPLIED_REASONING_OFF;
+  } else {
+    if (!(u->caps.flags & ASMODEL_CAP_REASONING_ON)) return -1;
+    effort = budget > 0 && budget <= 256 ? "low" : "medium";
+    u->last_generation.applied |= ASMODEL_APPLIED_REASONING_ON;
+  }
+  return putsb(body, ",\"reasoning\":{\"effort\":") ||
+         json_string(body, effort) || putsb(body, "}");
+}
+
+static char *responses_function_arguments(const char *json) {
+  const char *call = strstr(json, "\"function_call\"");
+  const char *p;
+  char *out;
+  if (!call) call = json;
+  p = find_key(call, "arguments");
+  if (!p) return NULL;
+  out = decode_json_string(p);
+  if (out) return out;
+  return json_value_object(call, "arguments");
+}
+
+static char *responses_output_text(const char *json) {
+  const char *item = strstr(json, "\"output_text\"");
+  const char *p;
+  if (!item) return NULL;
+  p = find_key(item, "text");
+  return p ? decode_json_string(p) : NULL;
+}
+
+static int build_lmstudio_responses(bytes *body, oai_provider *u,
+                                    const char *sys, const char *user,
+                                    const char *grammar,
+                                    const asmodel_generate_params *params,
+                                    schema_kind skind, int draft_mode,
+                                    asmodel_reasoning_mode reasoning) {
+  char n[160];
+  if (putsb(body, "{\"model\":") || json_string(body, u->model) ||
+      putsb(body, ",\"instructions\":") || json_string(body, sys ? sys : "") ||
+      putsb(body, ",\"input\":") || json_string(body, user ? user : ""))
+    return -1;
+  snprintf(n, sizeof n,
+           ",\"temperature\":%.8g,\"top_p\":%.8g,\"max_output_tokens\":%d",
+           params->temperature, params->top_p > 0 ? params->top_p : 1.0,
+           params->max_tokens);
+  if (putsb(body, n) ||
+      append_reasoning_responses(body, u, reasoning,
+                                 params->reasoning_budget))
+    return -1;
+  if (skind != SCHEMA_NONE) {
+    if (putsb(body,
+              ",\"tools\":[{\"type\":\"function\","
+              "\"name\":\"asmodel_emit\","
+              "\"description\":\"Emit the required constrained value\","
+              "\"parameters\":"))
+      return -1;
+    if (append_schema(body, skind, grammar, draft_mode) ||
+        putsb(body,
+              ",\"strict\":true}],\"tool_choice\":\"required\""))
+      return -1;
+    u->last_generation.applied |= ASMODEL_APPLIED_CONSTRAINT;
+  }
+  if (putsb(body, ",\"store\":false")) return -1;
+  return putsb(body, "}");
+}
+
 static int oai_generate(void *ud, const char *sys, const char *user,
                         const char *grammar,
                         const asmodel_generate_params *params,
@@ -765,72 +1065,193 @@ static int oai_generate(void *ud, const char *sys, const char *user,
   const char *content;
   char *finish = NULL;
   schema_kind skind = SCHEMA_NONE;
+  asmodel_reasoning_mode reasoning;
+  int use_responses = 0;
+  int stream_chat = 0;
+  int hit_length = 0;
   /* The short content marker is retained in the CALL evidence after the
    * write. Only the explicit instruction sentinel means that this pass may
    * choose a new draft write; otherwise a later decision could try to write
    * the already-created artifact again. */
   int draft_mode = user && strstr(user, "@asngn:draft-mode") != NULL;
-  int rc = -1;
+  int rc = ASMODEL_ERR_BACKEND;
   *out_text = NULL;
   u->last_error[0] = '\0';
-  if (putsb(&body, "{\"model\":" ) || json_string(&body, u->model) ||
-      putsb(&body, ",\"messages\":[{\"role\":\"system\",\"content\":") ||
-      json_string(&body, sys ? sys : "") ||
-      putsb(&body, "},{\"role\":\"user\",\"content\":") ||
-      json_string(&body, user ? user : "") || putsb(&body, "}]")) goto done;
-  snprintf(num, sizeof num, ",\"temperature\":%.8g,\"top_p\":%.8g,\"max_tokens\":%d",
-           params->temperature, params->top_p > 0 ? params->top_p : 1.0,
-           params->max_tokens);
-  if (putsb(&body, num)) goto done;
-  if (u->reasoning_effort && u->reasoning_effort[0] &&
-      (putsb(&body, ",\"reasoning_effort\":") ||
-       json_string(&body, u->reasoning_effort))) goto done;
-  if (grammar && u->grammar_mode && strcmp(u->grammar_mode, "none") != 0) {
-    if (strcmp(u->grammar_mode, "lmstudio") == 0) {
-      skind = schema_for_grammar(grammar);
-      if (skind == SCHEMA_NONE) {
-        snprintf(u->last_error, sizeof u->last_error,
-                 "LM Studio mode does not recognize the requested constraint");
-        goto done;
-      }
-      if (append_response_format(&body, skind, grammar, draft_mode))
-        goto done;
-    } else if (strcmp(u->grammar_mode, "vllm") == 0) {
-      if (putsb(&body, ",\"structured_outputs\":{\"grammar\":" ) ||
-          json_string(&body, grammar) || putsb(&body, "}")) goto done;
-    } else if (putsb(&body, ",\"grammar\":" ) ||
-               json_string(&body, grammar)) goto done;
-  }
-  if (putsb(&body, "}")) goto done;
-  if (post_json(u, "/chat/completions", body.p, cancel, &reply,
-                error, sizeof error)) {
-    snprintf(u->last_error, sizeof u->last_error, "%s",
-             error[0] ? error : "OpenAI-compatible HTTP request failed");
+  memset(&u->last_generation, 0, sizeof u->last_generation);
+  u->last_generation.finish_reason = ASMODEL_FINISH_ERROR;
+  reasoning = effective_reasoning(u, params);
+  if (grammar) skind = schema_for_grammar(grammar);
+  if (grammar && params->require_constraint && skind == SCHEMA_NONE &&
+      !(u->caps.flags & ASMODEL_CAP_GBNF)) {
+    snprintf(u->last_error, sizeof u->last_error,
+             "provider profile cannot enforce the requested constraint");
+    rc = ASMODEL_ERR_UNSUPPORTED;
     goto done;
   }
-  if (out_in) *out_in = int_key(reply.p, "prompt_tokens");
-  if (out_gen) *out_gen = int_key(reply.p, "completion_tokens");
-  finish = json_value_string(reply.p, "finish_reason");
-  if (finish && strcmp(finish, "length") == 0) {
+  /* A small model may ignore a forced function tool while returning HTTP
+   * 200.  For constrained LM Studio calls, JSON Schema is enforced by the
+   * decoder and is therefore the stronger contract. */
+  use_responses = u->remote_provider == ASMODEL_REMOTE_LMSTUDIO &&
+                  reasoning != ASMODEL_REASONING_DEFAULT && grammar == NULL;
+  if (use_responses) {
+    if (grammar && skind == SCHEMA_NONE) {
+      snprintf(u->last_error, sizeof u->last_error,
+               "LM Studio Responses requires a recognized action schema");
+      rc = ASMODEL_ERR_UNSUPPORTED;
+      goto done;
+    }
+    if (build_lmstudio_responses(&body, u, sys, user, grammar, params,
+                                 skind, draft_mode, reasoning)) {
+      snprintf(u->last_error, sizeof u->last_error,
+               "LM Studio profile cannot apply the requested controls");
+      rc = ASMODEL_ERR_UNSUPPORTED;
+      goto done;
+    }
+  } else {
+    /* Known local providers support Chat Completions SSE.  Use it even for
+     * private/buffered phases such as DRAFT: their bytes must not reach the
+     * UI, but SSE still gives the transport an explicit end-of-generation
+     * boundary and keeps cancellation responsive.  Preserve the conservative
+     * non-streaming default only for an unknown generic-compatible server
+     * when the caller did not request progress. */
+    stream_chat = token_fn != NULL ||
+                  u->remote_provider != ASMODEL_REMOTE_GENERIC;
+    if (putsb(&body, "{\"model\":" ) || json_string(&body, u->model) ||
+        putsb(&body, ",\"messages\":[{\"role\":\"system\",\"content\":") ||
+        json_string(&body, sys ? sys : "") ||
+        putsb(&body, "},{\"role\":\"user\",\"content\":") ||
+        json_string(&body, user ? user : "") || putsb(&body, "}]")) goto done;
+    snprintf(num, sizeof num,
+             ",\"temperature\":%.8g,\"top_p\":%.8g,\"max_tokens\":%d",
+             params->temperature, params->top_p > 0 ? params->top_p : 1.0,
+             params->max_tokens);
+    if (putsb(&body, num)) goto done;
+    if (append_reasoning_chat(&body, u, reasoning,
+                              params->reasoning_budget)) {
+      snprintf(u->last_error, sizeof u->last_error,
+               "provider profile cannot apply the requested reasoning mode");
+      rc = ASMODEL_ERR_UNSUPPORTED;
+      goto done;
+    }
+    if (grammar) {
+      if (u->remote_provider == ASMODEL_REMOTE_LMSTUDIO ||
+          (u->remote_provider == ASMODEL_REMOTE_VLLM && skind != SCHEMA_NONE)) {
+        if (skind == SCHEMA_NONE ||
+            append_response_format(&body, skind, grammar, draft_mode)) {
+          snprintf(u->last_error, sizeof u->last_error,
+                   "provider profile cannot translate the requested schema");
+          rc = ASMODEL_ERR_UNSUPPORTED;
+          goto done;
+        }
+      } else if (u->remote_provider == ASMODEL_REMOTE_VLLM) {
+        if (putsb(&body, ",\"structured_outputs\":{\"grammar\":" ) ||
+            json_string(&body, grammar) || putsb(&body, "}")) goto done;
+      } else if (u->remote_provider == ASMODEL_REMOTE_LLAMA_SERVER) {
+        if (putsb(&body, ",\"grammar\":" ) ||
+            json_string(&body, grammar) ||
+            putsb(&body, ",\"cache_prompt\":true")) goto done;
+        u->last_generation.applied |= ASMODEL_APPLIED_PREFIX_CACHE;
+      } else if (params->require_constraint) {
+        snprintf(u->last_error, sizeof u->last_error,
+                 "generic OpenAI profile cannot guarantee constrained output");
+        rc = ASMODEL_ERR_UNSUPPORTED;
+        goto done;
+      }
+      u->last_generation.applied |= ASMODEL_APPLIED_CONSTRAINT;
+    }
+    if (stream_chat &&
+        putsb(&body,
+              ",\"stream\":true,\"stream_options\":{\"include_usage\":true}"))
+      goto done;
+    if (putsb(&body, "}")) goto done;
+  }
+  {
+    int http_rc = post_json(
+        u, use_responses ? "/responses" : "/chat/completions", body.p,
+        cancel, &reply, stream_chat ? token_fn : NULL, token_ud,
+        params->deadline_ms, error, sizeof error);
+    if (http_rc != 0) {
+      snprintf(u->last_error, sizeof u->last_error, "%s",
+               error[0] ? error : "OpenAI-compatible HTTP request failed");
+      if (http_rc == -2) rc = ASMODEL_ERR_TIMEOUT;
+      goto done;
+    }
+  }
+  if (stream_chat) {
+    const char *p = reply.p;
+    bytes decoded = {0};
+    while (p && *p && isspace((unsigned char)*p)) p++;
+    /* A few older compatible servers accept `stream` but still return a
+     * normal JSON object.  Accept that response without weakening SSE for
+     * conforming LM Studio, llama.cpp and vLLM servers. */
+    if (!p || *p != '{') {
+      if (chat_sse_response(reply.p ? reply.p : "", &decoded) != 0) {
+        snprintf(u->last_error, sizeof u->last_error,
+                 "invalid Chat Completions SSE response: %.120s",
+                 reply.p ? reply.p : "");
+        free(decoded.p);
+        goto done;
+      }
+      free(reply.p);
+      reply = decoded;
+    }
+  }
+  u->last_generation.input_tokens = int_key(
+      reply.p, use_responses ? "input_tokens" : "prompt_tokens");
+  u->last_generation.output_tokens = int_key(
+      reply.p, use_responses ? "output_tokens" : "completion_tokens");
+  u->last_generation.reasoning_tokens = int_key(reply.p, "reasoning_tokens");
+  u->last_generation.cached_input_tokens = int_key(reply.p, "cached_tokens");
+  if (out_in) *out_in = u->last_generation.input_tokens;
+  if (out_gen) *out_gen = u->last_generation.output_tokens;
+  if (reasoning == ASMODEL_REASONING_REQUIRED_OFF &&
+      (u->caps.flags & ASMODEL_CAP_USAGE_REASONING) &&
+      find_key(reply.p, "reasoning_tokens") == NULL) {
+    snprintf(u->last_error, sizeof u->last_error,
+             "provider did not report reasoning usage; reasoning-off "
+             "postcondition cannot be verified");
+    rc = ASMODEL_ERR_UNSUPPORTED;
+    goto done;
+  }
+  if (reasoning == ASMODEL_REASONING_REQUIRED_OFF &&
+      u->last_generation.reasoning_tokens > 0) {
+    snprintf(u->last_error, sizeof u->last_error,
+             "provider violated reasoning-off contract (%d reasoning tokens)",
+             u->last_generation.reasoning_tokens);
+    rc = ASMODEL_ERR_UNSUPPORTED;
+    goto done;
+  }
+  finish = json_value_string(reply.p,
+                             use_responses ? "status" : "finish_reason");
+  if ((finish && strcmp(finish, "length") == 0) ||
+      (finish && strcmp(finish, "incomplete") == 0)) {
+    hit_length = 1;
+    u->last_generation.finish_reason = ASMODEL_FINISH_LENGTH;
     snprintf(u->last_error, sizeof u->last_error,
              "completion truncated at %d generated tokens "
              "(max_tokens=%d, finish_reason=length)",
              out_gen ? *out_gen : 0, params->max_tokens);
-    goto done;
+    rc = ASMODEL_ERR_LIMIT;
   }
-  content = find_key(reply.p, "content");
-  if (!content) {
-    snprintf(u->last_error, sizeof u->last_error,
-             "response has no assistant content");
-    goto done;
+  if (use_responses && skind != SCHEMA_NONE) {
+    char *arguments = responses_function_arguments(reply.p);
+    if (arguments) {
+      *out_text = normalize_schema_json(skind, arguments, draft_mode);
+      free(arguments);
+    }
+  } else if (use_responses) {
+    *out_text = responses_output_text(reply.p);
+  } else {
+    content = find_key(reply.p, "content");
+    *out_text = content ? decode_json_string(content) : NULL;
   }
-  *out_text = decode_json_string(content);
   if (!*out_text) {
     snprintf(u->last_error, sizeof u->last_error,
-             "assistant content is not a complete JSON string");
+             "response has no valid assistant output");
     goto done;
   }
-  if (skind != SCHEMA_NONE) {
+  if (!hit_length && !use_responses && skind != SCHEMA_NONE &&
+      (u->last_generation.applied & ASMODEL_APPLIED_CONSTRAINT)) {
     char *normalized = normalize_schema_json(skind, *out_text, draft_mode);
     free(*out_text);
     *out_text = normalized;
@@ -841,9 +1262,12 @@ static int oai_generate(void *ud, const char *sys, const char *user,
     }
   }
   if (token_fn) token_fn(*out_text, strlen(*out_text), token_ud);
-  rc = 0;
+  if (!hit_length) {
+    u->last_generation.finish_reason = ASMODEL_FINISH_STOP;
+    rc = ASMODEL_OK;
+  }
 done:
-  if (rc != 0) {
+  if (rc != 0 && rc != ASMODEL_ERR_LIMIT) {
     if (!u->last_error[0])
       snprintf(u->last_error, sizeof u->last_error,
                "failed to build or decode the OpenAI-compatible request");
@@ -865,6 +1289,7 @@ static int oai_embed(void *ud, const char *text, int is_query, float *out) {
       putsb(&body, ",\"input\":" ) || json_string(&body, text) ||
       putsb(&body, "}")) goto done;
   if (post_json(u, "/embeddings", body.p, NULL, &reply,
+                NULL, NULL, 0,
                 error, sizeof error)) goto done;
   p = find_key(reply.p, "embedding");
   if (!p) goto done;
@@ -899,11 +1324,37 @@ static int heuristic(void *ud, const char *text) {
   return (int)((n + 3) / 4);
 }
 
+static asmodel_remote_provider remote_profile(const asmodel_spec *spec) {
+  return spec->remote_provider == ASMODEL_REMOTE_AUTO
+             ? ASMODEL_REMOTE_GENERIC
+             : spec->remote_provider;
+}
+
+static void init_caps(oai_provider *u, int context_tokens) {
+  if (asmodel_remote_capabilities(u->remote_provider, context_tokens,
+                                  u->embedding, &u->caps) != 0)
+    memset(&u->caps, 0, sizeof u->caps);
+  u->remote_provider = u->caps.remote_provider;
+}
+
+static int oai_capabilities(void *ud, asmodel_capabilities *out) {
+  oai_provider *u = (oai_provider *)ud;
+  if (!u || !out) return -1;
+  *out = u->caps;
+  return 0;
+}
+
+static int oai_last_generation_info(void *ud, asmodel_generation_info *out) {
+  oai_provider *u = (oai_provider *)ud;
+  if (!u || !out) return -1;
+  *out = u->last_generation;
+  return 0;
+}
+
 static void oai_destroy(void *ud) {
   oai_provider *u = (oai_provider *)ud;
   if (!u) return;
-  free(u->base_url); free(u->model); free(u->api_key_env);
-  free(u->grammar_mode); free(u->reasoning_effort); free(u);
+  free(u->base_url); free(u->model); free(u->api_key_env); free(u);
 }
 
 static const char *oai_last_error(void *ud) {
@@ -921,19 +1372,20 @@ int asmodel_openai_provider_create(const asmodel_spec *spec,
   u->base_url = odup(spec->base_url);
   u->model = odup(spec->remote_model);
   u->api_key_env = odup(spec->api_key_env);
-  u->grammar_mode = odup(spec->api_grammar ? spec->api_grammar : "none");
-  u->reasoning_effort = odup(spec->reasoning_effort);
+  u->remote_provider = remote_profile(spec);
   u->embedding = spec->embedding; u->dim = spec->embedding_dim;
-  if (!u->base_url || !u->model || !u->grammar_mode ||
-      (spec->reasoning_effort && !u->reasoning_effort)) {
+  if (!u->base_url || !u->model) {
     oai_destroy(u); return -1;
   }
+  init_caps(u, spec->context_tokens);
   memset(out, 0, sizeof *out);
   out->userdata = u;
   out->generate = spec->embedding ? NULL : oai_generate;
   out->embed = spec->embedding ? oai_embed : NULL;
   out->count_tokens = heuristic;
   out->last_error = oai_last_error;
+  out->capabilities = oai_capabilities;
+  out->last_generation_info = oai_last_generation_info;
   out->destroy = oai_destroy;
   (void)error; (void)error_size;
   return 0;
