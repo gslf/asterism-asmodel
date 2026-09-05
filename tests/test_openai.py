@@ -128,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/v1/embeddings":
             assert request["model"] == "test-model"
             assert request["input"] == "embed me"
-            response = {"data": [{"embedding": [0.6, 0.0, 0.8]}]}
+            response = {"data": [{"index": 0, "embedding": [0.6, 0.0, 0.8]}]}
         else:
             self.send_error(404)
             return

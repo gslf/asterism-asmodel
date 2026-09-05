@@ -79,3 +79,13 @@ Remote admission includes the selected schema in its conservative byte estimate.
 Requests rejected before HTTP dispatch report known zero consumption. Declared
 capability profiles are adapter contracts, not evidence that a particular server,
 model and template combination has passed real-provider conformance tests.
+
+## Structured transport validation
+
+`asmodel_json.h` exposes the strict JSON codec used by the providers and engine
+clients. The implementation separates parsing, value ownership, serialization
+and byte/Unicode helpers; applications do not need a second copy of the codec.
+OpenAI-shaped responses use structural field lookup, bounded integer usage and
+explicit choice/vector indices. Duplicate keys, embedded NUL in output text,
+non-finite vectors, wrong dimensions and incomplete SSE streams are rejected.
+A provider name alone still does not establish real-model conformance.

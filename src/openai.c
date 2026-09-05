@@ -1,4 +1,5 @@
 #include "asmodel.h"
+#include "openai_decode.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -317,264 +318,10 @@ done:
 #endif
 }
 
-static const char *find_key(const char *json, const char *key) {
-  bytes pat = {0};
-  const char *p;
-  if (json_string(&pat, key)) { free(pat.p); return NULL; }
-  p = strstr(json, pat.p);
-  free(pat.p);
-  if (!p) return NULL;
-  p = strchr(p, ':');
-  return p ? p + 1 : NULL;
-}
-
-static int hex4(const char *p, unsigned *out) {
-  unsigned v = 0;
-  int i;
-  for (i = 0; i < 4; ++i) {
-    unsigned c = (unsigned char)p[i], d;
-    if (c >= '0' && c <= '9') d = c - '0';
-    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-    else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-    else return -1;
-    v = (v << 4) | d;
-  }
-  *out = v;
-  return 0;
-}
-
-static int put_codepoint(bytes *b, unsigned cp) {
-  char s[4];
-  size_t n;
-  if (cp <= 0x7f) { s[0] = (char)cp; n = 1; }
-  else if (cp <= 0x7ff) {
-    s[0] = (char)(0xc0 | (cp >> 6));
-    s[1] = (char)(0x80 | (cp & 0x3f)); n = 2;
-  } else if (cp <= 0xffff) {
-    if (cp >= 0xd800 && cp <= 0xdfff) return -1;
-    s[0] = (char)(0xe0 | (cp >> 12));
-    s[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
-    s[2] = (char)(0x80 | (cp & 0x3f)); n = 3;
-  } else if (cp <= 0x10ffff) {
-    s[0] = (char)(0xf0 | (cp >> 18));
-    s[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
-    s[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
-    s[3] = (char)(0x80 | (cp & 0x3f)); n = 4;
-  } else return -1;
-  return putn(b, s, n);
-}
-
-static char *decode_json_string(const char *p) {
-  bytes b = {0};
-  while (*p && isspace((unsigned char)*p)) p++;
-  if (*p++ != '"') return NULL;
-  while (*p && *p != '"') {
-    if (*p != '\\') { if (putn(&b, p++, 1)) goto fail; continue; }
-    p++;
-    if (!*p) goto fail;
-    if (*p == 'u') {
-      unsigned cp, low;
-      p++;
-      if (hex4(p, &cp)) goto fail;
-      p += 4;
-      if (cp >= 0xd800 && cp <= 0xdbff) {
-        if (p[0] != '\\' || p[1] != 'u' || hex4(p + 2, &low) ||
-            low < 0xdc00 || low > 0xdfff) goto fail;
-        cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
-        p += 6;
-      }
-      if (put_codepoint(&b, cp)) goto fail;
-      continue;
-    }
-    switch (*p) {
-      case 'n': if (putn(&b, "\n", 1)) goto fail; break;
-      case 'r': if (putn(&b, "\r", 1)) goto fail; break;
-      case 't': if (putn(&b, "\t", 1)) goto fail; break;
-      case '"': case '\\': case '/': if (putn(&b, p, 1)) goto fail; break;
-      case 'b': if (putn(&b, "\b", 1)) goto fail; break;
-      case 'f': if (putn(&b, "\f", 1)) goto fail; break;
-      default: goto fail;
-    }
-    p++;
-  }
-  if (*p != '"') goto fail;
-  if (!b.p) b.p = odup("");
-  return b.p;
-fail:
-  free(b.p); return NULL;
-}
-
-static int int_key(const char *json, const char *key) {
-  const char *p = find_key(json, key);
-  return p ? (int)strtol(p, NULL, 10) : 0;
-}
-
 static int append_response_format(bytes *body, const char *schema) {
   return putsb(body, ",\"response_format\":{\"type\":\"json_schema\","
       "\"json_schema\":{\"name\":\"asmodel_output\",\"strict\":true,\"schema\":") ||
       putsb(body, schema) || putsb(body, "}}");
-}
-
-static char *json_value_string(const char *json, const char *key) {
-  const char *p = find_key(json, key);
-  return p ? decode_json_string(p) : NULL;
-}
-
-/* Copy one syntactically complete JSON object value. Structured output can
- * guarantee balanced tool arguments only while they remain an object; the
- * old string field discarded that guarantee before the xCDN call parser. */
-static char *json_value_object(const char *json, const char *key) {
-  const char *p = find_key(json, key), *start;
-  int depth = 0, in_string = 0, escaped = 0;
-  size_t n;
-  char *out;
-  if (!p) return NULL;
-  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-  if (*p != '{') return NULL;
-  start = p;
-  for (; *p; p++) {
-    char ch = *p;
-    if (in_string) {
-      if (escaped) escaped = 0;
-      else if (ch == '\\') escaped = 1;
-      else if (ch == '"') in_string = 0;
-      continue;
-    }
-    if (ch == '"') in_string = 1;
-    else if (ch == '{' || ch == '[') depth++;
-    else if (ch == '}' || ch == ']') {
-      if (--depth == 0) {
-        n = (size_t)(p - start + 1);
-        out = (char *)malloc(n + 1);
-        if (!out) return NULL;
-        memcpy(out, start, n);
-        out[n] = '\0';
-        return out;
-      }
-      if (depth < 0) return NULL;
-    }
-  }
-  return NULL;
-}
-
-/* Convert an OpenAI Chat Completions SSE stream into the ordinary response
- * shape consumed by the decoder below.  Keeping one decoder for streamed and
- * non-streamed calls prevents provider-specific output validation drift. */
-static int chat_sse_response(const char *sse, bytes *response) {
-  const char *line = sse;
-  bytes content = {0};
-  char *finish = NULL;
-  int prompt_tokens = 0, completion_tokens = 0;
-  int reasoning_tokens = 0, cached_tokens = 0;
-  int have_prompt = 0, have_completion = 0;
-  int have_reasoning = 0, have_cached = 0;
-  int saw_event = 0, saw_choice = 0;
-  int rc = -1;
-
-  while (line && *line) {
-    const char *end = strchr(line, '\n');
-    const char *data, *data_end;
-    size_t line_n = end ? (size_t)(end - line) : strlen(line);
-    if (line_n > 0 && line[line_n - 1] == '\r') line_n--;
-    if (line_n < 5 || memcmp(line, "data:", 5) != 0) {
-      line = end ? end + 1 : NULL;
-      continue;
-    }
-    data = line + 5;
-    data_end = line + line_n;
-    while (data < data_end && (*data == ' ' || *data == '\t')) data++;
-    while (data_end > data &&
-           (data_end[-1] == ' ' || data_end[-1] == '\t')) data_end--;
-    if ((size_t)(data_end - data) == 6 && memcmp(data, "[DONE]", 6) == 0) {
-      line = end ? end + 1 : NULL;
-      continue;
-    }
-    if (data < data_end) {
-      size_t n = (size_t)(data_end - data);
-      char *chunk = (char *)malloc(n + 1);
-      char *delta = NULL, *piece = NULL, *next_finish = NULL;
-      const char *value;
-      if (!chunk) goto done;
-      memcpy(chunk, data, n);
-      chunk[n] = '\0';
-      saw_event = 1;
-
-      delta = json_value_object(chunk, "delta");
-      if (delta) {
-        saw_choice = 1;
-        value = find_key(delta, "content");
-        if (value) piece = decode_json_string(value);
-        if (piece && putsb(&content, piece)) {
-          free(piece); free(delta); free(chunk);
-          goto done;
-        }
-      }
-      next_finish = json_value_string(chunk, "finish_reason");
-      if (next_finish) {
-        saw_choice = 1;
-        free(finish);
-        finish = next_finish;
-      }
-      value = find_key(chunk, "prompt_tokens");
-      if (value) { prompt_tokens = (int)strtol(value, NULL, 10); have_prompt = 1; }
-      value = find_key(chunk, "completion_tokens");
-      if (value) {
-        completion_tokens = (int)strtol(value, NULL, 10);
-        have_completion = 1;
-      }
-      value = find_key(chunk, "reasoning_tokens");
-      if (value) {
-        reasoning_tokens = (int)strtol(value, NULL, 10);
-        have_reasoning = 1;
-      }
-      value = find_key(chunk, "cached_tokens");
-      if (value) { cached_tokens = (int)strtol(value, NULL, 10); have_cached = 1; }
-      free(piece);
-      free(delta);
-      free(chunk);
-    }
-    line = end ? end + 1 : NULL;
-  }
-  if (!saw_event || !saw_choice) goto done;
-  if (!content.p && putsb(&content, "")) goto done;
-  if (putsb(response, "{\"choices\":[{\"message\":{\"content\":" ) ||
-      json_string(response, content.p) ||
-      putsb(response, "},\"finish_reason\":" ) ||
-      json_string(response, finish ? finish : "stop") ||
-      putsb(response, "}],\"usage\":{"))
-    goto done;
-  if (have_prompt) {
-    char n[48];
-    snprintf(n, sizeof n, "\"prompt_tokens\":%d", prompt_tokens);
-    if (putsb(response, n)) goto done;
-  }
-  if (have_completion) {
-    char n[64];
-    snprintf(n, sizeof n, "%s\"completion_tokens\":%d",
-             have_prompt ? "," : "", completion_tokens);
-    if (putsb(response, n)) goto done;
-  }
-  if (have_reasoning) {
-    char n[96];
-    snprintf(n, sizeof n,
-             "%s\"completion_tokens_details\":{\"reasoning_tokens\":%d}",
-             (have_prompt || have_completion) ? "," : "", reasoning_tokens);
-    if (putsb(response, n)) goto done;
-  }
-  if (have_cached) {
-    char n[96];
-    snprintf(n, sizeof n,
-             "%s\"prompt_tokens_details\":{\"cached_tokens\":%d}",
-             (have_prompt || have_completion || have_reasoning) ? "," : "",
-             cached_tokens);
-    if (putsb(response, n)) goto done;
-  }
-  if (putsb(response, "}}")) goto done;
-  rc = 0;
-done:
-  free(content.p);
-  free(finish);
-  return rc;
 }
 
 static asmodel_reasoning_mode effective_reasoning(
@@ -643,14 +390,6 @@ static int append_reasoning_responses(bytes *body, oai_provider *u,
          json_string(body, effort) || putsb(body, "}");
 }
 
-static char *responses_output_text(const char *json) {
-  const char *item = strstr(json, "\"output_text\"");
-  const char *p;
-  if (!item) return NULL;
-  p = find_key(item, "text");
-  return p ? decode_json_string(p) : NULL;
-}
-
 static int build_lmstudio_responses(bytes *body, oai_provider *u,
                                     const char *sys, const char *user,
                                     const asmodel_generate_params *params,
@@ -697,13 +436,10 @@ static int oai_generate(void *ud, const char *sys, const char *user,
   oai_provider *u = (oai_provider *)ud;
   bytes body = {0}, reply = {0};
   char num[128], error[256] = {0};
-  const char *content;
-  char *finish = NULL;
   const char *schema = params->output_schema;
   asmodel_reasoning_mode reasoning;
   int use_responses = 0;
   int stream_chat = 0;
-  int hit_length = 0;
   int rc = ASMODEL_ERR_BACKEND;
   *out_text = NULL;
   u->last_error[0] = '\0';
@@ -800,39 +536,18 @@ static int oai_generate(void *ud, const char *sys, const char *user,
       goto done;
     }
   }
-  if (stream_chat) {
-    const char *p = reply.p;
-    bytes decoded = {0};
-    while (p && *p && isspace((unsigned char)*p)) p++;
-    /* A few older compatible servers accept `stream` but still return a
-     * normal JSON object.  Accept that response without weakening SSE for
-     * conforming LM Studio, llama.cpp and vLLM servers. */
-    if (!p || *p != '{') {
-      if (chat_sse_response(reply.p ? reply.p : "", &decoded) != 0) {
-        snprintf(u->last_error, sizeof u->last_error,
-                 "invalid Chat Completions SSE response: %.120s",
-                 reply.p ? reply.p : "");
-        free(decoded.p);
-        goto done;
-      }
-      free(reply.p);
-      reply = decoded;
-    }
-  }
-  u->last_generation.usage_known =
-      find_key(reply.p, use_responses ? "input_tokens" : "prompt_tokens") != NULL &&
-      find_key(reply.p, use_responses ? "output_tokens" : "completion_tokens") != NULL;
-  u->last_generation.input_tokens = int_key(
-      reply.p, use_responses ? "input_tokens" : "prompt_tokens");
-  u->last_generation.output_tokens = int_key(
-      reply.p, use_responses ? "output_tokens" : "completion_tokens");
-  u->last_generation.reasoning_tokens = int_key(reply.p, "reasoning_tokens");
-  u->last_generation.cached_input_tokens = int_key(reply.p, "cached_tokens");
+  const char *response_start = reply.p;
+  while (response_start && *response_start && isspace((unsigned char)*response_start)) response_start++;
+  int reasoning_known = 0;
+  rc = asmodel_openai_decode(reply.p,use_responses,
+      stream_chat && (!response_start || *response_start != '{'),
+      &u->last_generation,out_text,&reasoning_known);
   if (out_in) *out_in = u->last_generation.input_tokens;
   if (out_gen) *out_gen = u->last_generation.output_tokens;
+  if (rc != ASMODEL_OK && rc != ASMODEL_ERR_LIMIT) goto done;
   if (reasoning == ASMODEL_REASONING_REQUIRED_OFF &&
       (u->caps.flags & ASMODEL_CAP_USAGE_REASONING) &&
-      find_key(reply.p, "reasoning_tokens") == NULL) {
+      !reasoning_known) {
     snprintf(u->last_error, sizeof u->last_error,
              "provider did not report reasoning usage; reasoning-off "
              "postcondition cannot be verified");
@@ -847,34 +562,10 @@ static int oai_generate(void *ud, const char *sys, const char *user,
     rc = ASMODEL_ERR_UNSUPPORTED;
     goto done;
   }
-  finish = json_value_string(reply.p,
-                             use_responses ? "status" : "finish_reason");
-  if ((finish && strcmp(finish, "length") == 0) ||
-      (finish && strcmp(finish, "incomplete") == 0)) {
-    hit_length = 1;
-    u->last_generation.finish_reason = ASMODEL_FINISH_LENGTH;
-    snprintf(u->last_error, sizeof u->last_error,
-             "completion truncated at %d generated tokens "
-             "(max_tokens=%d, finish_reason=length)",
-             out_gen ? *out_gen : 0, params->max_tokens);
-    rc = ASMODEL_ERR_LIMIT;
-  }
-  if (use_responses) {
-    *out_text = responses_output_text(reply.p);
-  } else {
-    content = find_key(reply.p, "content");
-    *out_text = content ? decode_json_string(content) : NULL;
-  }
-  if (!*out_text) {
-    snprintf(u->last_error, sizeof u->last_error,
-             "response has no valid assistant output");
-    goto done;
-  }
-  if (token_fn) token_fn(*out_text, strlen(*out_text), token_ud);
-  if (!hit_length) {
-    u->last_generation.finish_reason = ASMODEL_FINISH_STOP;
-    rc = ASMODEL_OK;
-  }
+  if (rc == ASMODEL_ERR_LIMIT)
+    snprintf(u->last_error,sizeof u->last_error,"completion reached its output limit");
+  if (token_fn) token_fn(*out_text,strlen(*out_text),token_ud);
+
 done:
   if (rc != 0 && rc != ASMODEL_ERR_LIMIT) {
     if (!u->last_error[0])
@@ -882,45 +573,20 @@ done:
                "failed to build or decode the OpenAI-compatible request");
     free(*out_text); *out_text = NULL;
   }
-  free(finish);
   free(body.p); free(reply.p);
   return rc;
 }
 
 static int oai_embed(void *ud, const char *text, int is_query, float *out) {
-  oai_provider *u = (oai_provider *)ud;
+  oai_provider *u = ud;
   bytes body = {0}, reply = {0};
   char error[256] = {0};
-  const char *p;
-  int i, rc = -1;
+  int rc = ASMODEL_ERR_BACKEND, tokens = 0, known = 0;
   (void)is_query;
-  if (putsb(&body, "{\"model\":" ) || json_string(&body, u->model) ||
-      putsb(&body, ",\"input\":" ) || json_string(&body, text) ||
-      putsb(&body, "}")) goto done;
-  if (post_json(u, "/embeddings", body.p, NULL, &reply,
-                NULL, NULL, 0,
-                error, sizeof error)) goto done;
-  p = find_key(reply.p, "embedding");
-  if (!p) goto done;
-  while (*p && *p != '[') p++;
-  if (*p++ != '[') goto done;
-  for (i = 0; i < u->dim; ++i) {
-    char *end;
-    while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
-    errno = 0; out[i] = strtof(p, &end);
-    if (end == p || errno == ERANGE) goto done;
-    p = end;
-  }
-  while (*p && isspace((unsigned char)*p)) p++;
-  if (*p != ']') goto done;
-  {
-    double norm = 0.0;
-    for (i = 0; i < u->dim; ++i) norm += (double)out[i] * out[i];
-    if (!(norm > 0.0)) goto done;
-    norm = sqrt(norm);
-    for (i = 0; i < u->dim; ++i) out[i] = (float)(out[i] / norm);
-  }
-  rc = 0;
+  if (putsb(&body,"{\"model\":") || json_string(&body,u->model) ||
+      putsb(&body,",\"input\":") || json_string(&body,text) || putsb(&body,"}")) goto done;
+  if (post_json(u,"/embeddings",body.p,NULL,&reply,NULL,NULL,0,error,sizeof error)) goto done;
+  rc = asmodel_openai_vectors(reply.p,1,u->dim,out,&tokens,&known);
 done:
   free(body.p); free(reply.p); return rc;
 }
