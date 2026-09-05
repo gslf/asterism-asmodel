@@ -9,8 +9,8 @@ extern "C" {
 #endif
 
 #define ASMODEL_VERSION_MAJOR 0
-#define ASMODEL_VERSION_MINOR 4
-#define ASMODEL_ABI_VERSION 4
+#define ASMODEL_VERSION_MINOR 5
+#define ASMODEL_ABI_VERSION 5
 #define ASMODEL_VERSION_PATCH 0
 #define ASMODEL_ID_MAX 64
 
@@ -116,6 +116,16 @@ typedef struct {
 
 typedef struct asmodel_manager asmodel_manager;
 
+/* Immutable preprocessing. Revisions are operator attestations, not inferred
+ * from model names. Embedded hosts use the GGUF digest for revision/tokenizer. */
+typedef struct {
+  char revision[128];
+  char tokenizer[128];
+  char pooling[64];
+  char query_prefix[256];
+  char document_prefix[256];
+} asmodel_embedding_pipeline;
+
 typedef struct {
   const char *id;
   asmodel_backend backend;
@@ -129,11 +139,18 @@ typedef struct {
   int gpu_layers;
   int embedding;
   int embedding_dim;
+  asmodel_embedding_pipeline pipeline;
   size_t ram_mb;
   size_t vram_mb;
   int warm;
   int kv_cache;
 } asmodel_spec;
+
+/* Canonical pipeline description, malloc-owned. UNSUPPORTED means that one
+ * of revision/tokenizer/pooling is unknown: do not reuse persistent vectors.
+ * This reads registered metadata without loading weights or contacting a server. */
+asmodel_err asmodel_manager_embedding_key(asmodel_manager *manager, const char *id,
+                                          char **out_key);
 
 typedef struct {
   double temperature;
@@ -152,6 +169,18 @@ typedef struct {
   const char *output_schema;
   asmodel_generation_info *result_info; /* optional per-request result */
 } asmodel_generate_params;
+
+typedef struct {
+  size_t completed; /* valid leading vectors; never inferred from HTTP success */
+  int input_tokens;
+  int usage_known; /* interrupted/missing usage remains unknown */
+  char error[512];
+} asmodel_embedding_info;
+typedef struct {
+  int64_t deadline_ms; /* total duration, including manager waits; zero unbounded */
+  volatile int *cancel;
+  asmodel_embedding_info *result_info;
+} asmodel_embed_params;
 
 /* On ASMODEL_ERR_LIMIT, generate still returns every decoded partial byte in
  * out_text and reports ASMODEL_FINISH_LENGTH.  The caller owns that text and
@@ -172,8 +201,8 @@ typedef struct {
                   asmodel_token_fn token_fn, void *token_userdata,
                   volatile int *cancel, char **out_text,
                   int *out_prompt_tokens, int *out_generated_tokens);
-  int (*embed)(void *userdata, const char *text, int is_query,
-               float *out_vector);
+  int (*embed)(void *userdata, const char *const *texts, size_t count,
+               int is_query, const asmodel_embed_params *params, float *out_vectors);
   int (*count_tokens)(void *userdata, const char *text);
   int (*count_prompt_tokens)(void *userdata, const char *system_prompt,
                              const char *user_prompt);
@@ -245,9 +274,14 @@ asmodel_err asmodel_generate(asmodel_manager *manager, const char *id,
                              volatile int *cancel, char **out_text,
                              int *out_prompt_tokens,
                              int *out_generated_tokens);
+/* Row-major vectors, count in 1..256. Capacity is measured in floats and checked
+ * against the registered dimension. Prefix preprocessing belongs to the pipeline
+ * owner. Native providers may batch; adapters may evaluate rows sequentially.
+ * On failure only result_info.completed leading rows are valid. */
 asmodel_err asmodel_embed(asmodel_manager *manager, const char *id,
-                          const char *text, int is_query,
-                          float *out_vector);
+                          const char *const *texts, size_t count, int is_query,
+                          const asmodel_embed_params *params,
+                          float *out_vectors, size_t capacity);
 int asmodel_count_tokens(asmodel_manager *manager, const char *id,
                          const char *text);
 int asmodel_count_prompt_tokens(asmodel_manager *manager, const char *id,

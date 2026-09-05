@@ -38,7 +38,7 @@ static void *first(void *ud) {
 }
 int main(void) {
   asmodel_manager *m = NULL;
-  asmodel_spec spec = {.id = "model"};
+  asmodel_spec spec = {.id = "model", .embedding = 1, .embedding_dim = 2};
   asmodel_limits limits = {.max_resident = 1};
   asmodel_generate_params p = {.deadline_ms = 20};
   asmodel_model_stats stats;
@@ -52,6 +52,11 @@ int main(void) {
   pthread_mutex_unlock(&lock);
   asmodel_err e = asmodel_generate(m, "model", "", "", NULL, &p, NULL, NULL,
                                    NULL, &out, NULL, NULL);
+  const char *input = "query";
+  float vector[2];
+  asmodel_embedding_info info = {0};
+  asmodel_embed_params ep = {.deadline_ms = 20, .result_info = &info};
+  asmodel_err embedding = asmodel_embed(m,"model",&input,1,1,&ep,vector,2);
   asmodel_manager_stats(m, &stats, 1);
   pthread_mutex_lock(&lock);
   int calls = entered;
@@ -61,7 +66,8 @@ int main(void) {
   pthread_join(worker, &result);
   asmodel_manager_destroy(m);
   free(out);
-  if (e != ASMODEL_ERR_TIMEOUT || calls != 1 || result || stats.in_use != 1) {
+  if (e != ASMODEL_ERR_TIMEOUT || embedding != ASMODEL_ERR_TIMEOUT ||
+      !info.usage_known || info.completed || calls != 1 || result || stats.in_use != 1) {
     fprintf(stderr, "queued request did not expire without dispatch: %d, calls=%d\n", e, calls);
     return 1;
   }

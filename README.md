@@ -47,7 +47,7 @@ ctest --test-dir build --output-on-failure
 
 See `include/asmodel.h` for the stable C API.
 
-## Accounting contract (ABI 4)
+## Accounting contract (ABI 5)
 
 `asmodel_provider_measure_prompt` distinguishes exact, estimated and unavailable
 counts. Exact status requires a successful template-aware callback and tokenizer
@@ -89,3 +89,29 @@ OpenAI-shaped responses use structural field lookup, bounded integer usage and
 explicit choice/vector indices. Duplicate keys, embedded NUL in output text,
 non-finite vectors, wrong dimensions and incomplete SSE streams are rejected.
 A provider name alone still does not establish real-model conformance.
+
+## Embedding batches and pipeline identity
+
+`asmodel_embed` accepts 1–256 texts and an explicit output capacity in floats.
+`asmodel_embed_params` carries cancellation, a total request duration and a
+per-call receipt. `completed` counts valid leading vectors, including partial
+batches; successful HTTP alone cannot set it. Non-finite, zero-length, missing,
+duplicate-index and wrong-dimension vectors fail validation. Every returned row
+is L2-normalized. Input is never silently truncated. Unknown consumption stays
+unknown after interruptions; usage is bound to the request.
+
+The manager applies `spec.pipeline.query_prefix` or `document_prefix` exactly
+once before both remote and native providers. Pipeline fields are immutable
+copies. `asmodel_manager_embedding_key` returns a canonical JSON description
+covering revision, tokenizer, pooling, prefixes, dimension, context and adapter.
+Missing revision/tokenizer/pooling returns `UNSUPPORTED`: applications must not
+reuse persistent vectors across restarts. Revision metadata is an operator
+attestation; the runtime cannot detect a server secretly replacing weights.
+Native hosts derive revision/tokenizer from the GGUF hash and declare pooling.
+
+Remote batches use one array request; embedded adapters may evaluate rows
+sequentially under one model context. Cancellable manager waits and remaining
+durations apply to embedding calls too. Native callbacks cooperate through the
+ggml abort hook. Model loading and synchronous WinHTTP I/O remain cooperation
+limits; this is not a hard real-time guarantee. Conservative remote admission
+uses UTF-8 bytes plus overhead until a verified tokenizer is available.

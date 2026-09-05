@@ -127,8 +127,13 @@ class Handler(BaseHTTPRequestHandler):
                 raise AssertionError(request["model"])
         elif self.path == "/v1/embeddings":
             assert request["model"] == "test-model"
-            assert request["input"] == "embed me"
-            response = {"data": [{"index": 0, "embedding": [0.6, 0.0, 0.8]}]}
+            if request["input"] == ["timeout"]:
+                time.sleep(0.2)
+            else:
+                assert request["input"] in (["embed me"], ["query α", "document β"])
+            response = {"data": [{"index": i, "embedding": [0.6, 0.0, 0.8]}
+                                 for i in reversed(range(len(request["input"])))],
+                        "usage": {"prompt_tokens": 8}}
         else:
             self.send_error(404)
             return

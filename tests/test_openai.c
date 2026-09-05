@@ -209,13 +209,30 @@ int main(int argc, char **argv) {
   if (asmodel_openai_provider_create(&spec, &embedder, error,
                                      sizeof error) != 0)
     return 6;
+  const char *embedding_text = "embed me";
+  asmodel_embedding_info embedding_info = {0};
+  asmodel_embed_params embedding_params = {.result_info = &embedding_info};
   if (!embedder.embed ||
-      embedder.embed(embedder.userdata, "embed me", 1, vector) != 0)
+      embedder.embed(embedder.userdata,&embedding_text,1,1,&embedding_params,vector) != 0 ||
+      embedding_info.completed != 1)
     return 6;
   if (fabsf(vector[0] - 0.6f) > 0.0001f ||
       fabsf(vector[1]) > 0.0001f ||
       fabsf(vector[2] - 0.8f) > 0.0001f)
     return 7;
+  const char *batch[] = {"query α", "document β"};
+  float batch_vectors[6];
+  if (embedder.embed(embedder.userdata,batch,2,0,&embedding_params,batch_vectors) ||
+      embedding_info.completed != 2 || !embedding_info.usage_known || embedding_info.input_tokens != 8)
+    return 26;
+  volatile int cancel_embedding = 1;
+  embedding_params.cancel = &cancel_embedding;
+  if (embedder.embed(embedder.userdata,batch,2,0,&embedding_params,batch_vectors) != ASMODEL_ERR_CANCELLED ||
+      !embedding_info.usage_known || embedding_info.completed) return 27;
+  embedding_params.cancel = NULL; embedding_params.deadline_ms = 20;
+  const char *slow = "timeout";
+  if (embedder.embed(embedder.userdata,&slow,1,1,&embedding_params,batch_vectors) != ASMODEL_ERR_TIMEOUT ||
+      embedding_info.usage_known || embedding_info.completed) return 28;
   /* Admission accounts for schemas before spending any remote inference. */
   asmodel_provider bounded;
   spec.embedding = 0; spec.context_tokens = 300; spec.remote_model = "budget-model";

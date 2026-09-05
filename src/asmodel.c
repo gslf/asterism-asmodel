@@ -1,6 +1,9 @@
 #include "asmodel.h"
+#include "pipeline.h"
+#include "runtime_clock.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +22,6 @@ static void mu_lock(asm_mutex *m) { EnterCriticalSection(m); }
 static void mu_unlock(asm_mutex *m) { LeaveCriticalSection(m); }
 static int mu_try(asm_mutex *m) { return TryEnterCriticalSection(m) != 0; }
 static void pause_wait(void) { Sleep(2); }
-static int64_t mono_ms(void) { return (int64_t)GetTickCount64(); }
 #else
 #include <pthread.h>
 typedef pthread_mutex_t asm_mutex;
@@ -32,11 +34,7 @@ static void pause_wait(void) {
   struct timespec delay = {0, 2000000};
   (void)nanosleep(&delay, NULL);
 }
-static int64_t mono_ms(void) {
-  struct timespec ts;
-  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
+
 #endif
 
 /* Short bounded waits keep the C99 manager portable. Native loading itself
@@ -227,6 +225,7 @@ asmodel_err asmodel_manager_register(asmodel_manager *m,
   if (!m || !spec || !spec->id || !spec->id[0] ||
       strlen(spec->id) >= ASMODEL_ID_MAX)
     return ASMODEL_ERR_INVALID;
+  if (!asmodel_pipeline_valid(&spec->pipeline)) return ASMODEL_ERR_INVALID;
   mu_lock(&m->mu);
   if (find_slot(m, spec->id)) {
     mu_unlock(&m->mu);
@@ -388,6 +387,7 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
     snprintf(params->result_info->error, sizeof params->result_info->error, "%s", detail);
   end_call(m, s);
   if (cancel && *cancel) return ASMODEL_ERR_CANCELLED;
+  if (deadline && mono_ms() >= deadline) return ASMODEL_ERR_TIMEOUT;
   if (rc == ASMODEL_OK) return ASMODEL_OK;
   if (rc >= ASMODEL_ERR_INVALID && rc <= ASMODEL_ERR_TIMEOUT)
     return seterr(m, (asmodel_err)rc, "generation failed for '%s'%s%s", id,
@@ -397,18 +397,56 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
 }
 
 asmodel_err asmodel_embed(asmodel_manager *m, const char *id,
-                          const char *text, int is_query, float *out) {
+                          const char *const *texts, size_t count, int is_query,
+                          const asmodel_embed_params *params, float *out, size_t capacity) {
   model_slot *s;
-  asmodel_err e;
-  int rc;
-  if (!m || !id || !text || !out) return ASMODEL_ERR_INVALID;
-  e = begin_call(m, id, &s);
+  char *prepared[256] = {0};
+  asmodel_embedding_info info = {0};
+  asmodel_embed_params request = params ? *params : (asmodel_embed_params){0};
+  asmodel_embedding_info *result = request.result_info ? request.result_info : &info;
+  memset(result,0,sizeof *result); result->usage_known = 1;
+  if (!m || !id || !texts || !out || !count || count > 256 || request.deadline_ms < 0 ||
+      capacity > SIZE_MAX/sizeof(float))
+    return ASMODEL_ERR_INVALID;
+  for (size_t i = 0; i < count; i++) if (!texts[i]) return ASMODEL_ERR_INVALID;
+  int64_t started = mono_ms();
+  int64_t deadline = request.deadline_ms > 0 ?
+      (request.deadline_ms > INT64_MAX-started ? INT64_MAX : started+request.deadline_ms) : 0;
+  asmodel_err e = begin_request(m,id,deadline,request.cancel,&s);
   if (e != ASMODEL_OK) return e;
-  rc = s->provider.embed ?
-      s->provider.embed(s->provider.userdata, text, is_query, out) : -1;
-  end_call(m, s);
-  return rc == 0 ? ASMODEL_OK : seterr(m, ASMODEL_ERR_BACKEND,
-                                      "embedding failed for '%s'", id);
+  request.result_info = result;
+  if (!s->spec.embedding || s->spec.embedding_dim <= 0 ||
+      (size_t)s->spec.embedding_dim > capacity/count) e = ASMODEL_ERR_INVALID;
+  else if (!s->provider.embed) e = ASMODEL_ERR_UNSUPPORTED;
+  else e = asmodel_pipeline_inputs(&s->spec.pipeline,texts,count,is_query,prepared);
+  if (e == ASMODEL_OK && deadline && (request.deadline_ms = deadline-mono_ms()) <= 0) e = ASMODEL_ERR_TIMEOUT;
+  else if (e == ASMODEL_OK && request.cancel && *request.cancel) e = ASMODEL_ERR_CANCELLED;
+  else if (e == ASMODEL_OK) {
+    result->usage_known = 0;
+    int rc = s->provider.embed(s->provider.userdata,(const char *const *)prepared,count,is_query,&request,out);
+    e = rc >= ASMODEL_OK && rc <= ASMODEL_ERR_TIMEOUT ? (asmodel_err)rc : ASMODEL_ERR_BACKEND;
+    if (result->completed > count || (e == ASMODEL_OK && result->completed != count) ||
+        result->input_tokens < 0) {
+      result->completed = 0; result->usage_known = 0; e = ASMODEL_ERR_BACKEND;
+    }
+    for (size_t i = 0; i < result->completed; i++) {
+      float *row = out+i*(size_t)s->spec.embedding_dim;
+      double norm = 0;
+      for (int j = 0; j < s->spec.embedding_dim; j++) norm += (double)row[j]*row[j];
+      if (!(norm > 0) || !isfinite(norm)) {
+        result->completed = i; e = ASMODEL_ERR_BACKEND; break;
+      }
+      norm = sqrt(norm);
+      for (int j = 0; j < s->spec.embedding_dim; j++) row[j] = (float)(row[j]/norm);
+    }
+    if (request.cancel && *request.cancel) e = ASMODEL_ERR_CANCELLED;
+    else if (deadline && mono_ms() >= deadline) e = ASMODEL_ERR_TIMEOUT;
+  }
+  if (e != ASMODEL_OK && !result->error[0])
+    snprintf(result->error,sizeof result->error,"embedding failed: %s",asmodel_err_name(e));
+  asmodel_pipeline_free(prepared,count);
+  end_call(m,s);
+  return e;
 }
 
 int asmodel_count_tokens(asmodel_manager *m, const char *id,
@@ -549,4 +587,14 @@ size_t asmodel_manager_stats(asmodel_manager *m, asmodel_model_stats *out,
   }
   mu_unlock(&m->mu);
   return n;
+}
+
+asmodel_err asmodel_manager_embedding_key(asmodel_manager *m, const char *id, char **out) {
+  if (!m || !id || !out) return ASMODEL_ERR_INVALID;
+  *out = NULL;
+  mu_lock(&m->mu);
+  model_slot *s = find_slot(m,id);
+  asmodel_err e = s ? asmodel_pipeline_key(&s->spec,out) : ASMODEL_ERR_NOT_FOUND;
+  mu_unlock(&m->mu);
+  return e;
 }

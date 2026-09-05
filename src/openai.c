@@ -10,6 +10,7 @@
 #include <string.h>
 
 #if defined(ASMODEL_WITH_CURL) || defined(_WIN32)
+#include "runtime_clock.h"
 #ifdef ASMODEL_WITH_CURL
 #include <curl/curl.h>
 #else
@@ -577,17 +578,39 @@ done:
   return rc;
 }
 
-static int oai_embed(void *ud, const char *text, int is_query, float *out) {
+static int oai_embed(void *ud, const char *const *texts, size_t count, int is_query,
+                     const asmodel_embed_params *params, float *out) {
   oai_provider *u = ud;
   bytes body = {0}, reply = {0};
-  char error[256] = {0};
-  int rc = ASMODEL_ERR_BACKEND, tokens = 0, known = 0;
-  (void)is_query;
-  if (putsb(&body,"{\"model\":") || json_string(&body,u->model) ||
-      putsb(&body,",\"input\":") || json_string(&body,text) || putsb(&body,"}")) goto done;
-  if (post_json(u,"/embeddings",body.p,NULL,&reply,NULL,NULL,0,error,sizeof error)) goto done;
-  rc = asmodel_openai_vectors(reply.p,1,u->dim,out,&tokens,&known);
-done:
+  asmodel_embedding_info local = {0};
+  asmodel_embedding_info *info = params && params->result_info ? params->result_info : &local;
+  asmodel_embed_params p = params ? *params : (asmodel_embed_params){0};
+  memset(info,0,sizeof *info); info->usage_known = 1;
+  int rc = ASMODEL_ERR_BACKEND;
+  int64_t started = mono_ms();
+  (void)is_query; /* The pipeline owner supplies query/document preprocessing. */
+  if (!texts || !count || count > 256 || !out || p.deadline_ms < 0) return ASMODEL_ERR_INVALID;
+  if (p.cancel && *p.cancel) return ASMODEL_ERR_CANCELLED;
+  if (putsb(&body,"{\"model\":") || json_string(&body,u->model) || putsb(&body,",\"input\":[")) goto done;
+  for (size_t i = 0; i < count; i++) {
+    if (!texts[i]) { rc = ASMODEL_ERR_INVALID; goto done; }
+    if (u->caps.context_tokens > 0 && (u->caps.context_tokens <= 16 || strlen(texts[i]) > (size_t)u->caps.context_tokens-16)) {
+      rc = ASMODEL_ERR_LIMIT; goto done;
+    }
+    if ((i && putsb(&body,",")) || json_string(&body,texts[i])) goto done;
+  }
+  if (putsb(&body,"]}")) goto done;
+  if (p.cancel && *p.cancel) { rc = ASMODEL_ERR_CANCELLED; goto done; }
+  if (p.deadline_ms > 0 && (p.deadline_ms -= mono_ms()-started) <= 0) {
+    rc = ASMODEL_ERR_TIMEOUT; goto done;
+  }
+  info->usage_known = 0;
+  int http = post_json(u,"/embeddings",body.p,p.cancel,&reply,NULL,NULL,p.deadline_ms,info->error,sizeof info->error);
+  if (http) { rc = p.cancel && *p.cancel ? ASMODEL_ERR_CANCELLED : http == -2 ? ASMODEL_ERR_TIMEOUT : ASMODEL_ERR_BACKEND; goto done; }
+  rc = asmodel_openai_vectors(reply.p,count,u->dim,out,&info->input_tokens,&info->usage_known);
+  if (rc == ASMODEL_OK) info->completed = count;
+ done:
+  if (rc != ASMODEL_OK && !info->error[0]) snprintf(info->error,sizeof info->error,"embedding request failed: %s",asmodel_err_name((asmodel_err)rc));
   free(body.p); free(reply.p); return rc;
 }
 

@@ -5,7 +5,7 @@ option(ASMODEL_BUILD_TESTS "Build asmodel tests" ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(CURL QUIET)
-add_library(asmodel_obj OBJECT src/asmodel.c src/openai.c src/openai_decode.c src/tokens.c
+add_library(asmodel_obj OBJECT src/asmodel.c src/openai.c src/openai_decode.c src/tokens.c src/pipeline.c
   src/json_support.c src/json_value.c src/json_parse.c src/json_write.c)
 target_include_directories(asmodel_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(asmodel_obj PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
@@ -52,6 +52,9 @@ endif()
 
 if(ASMODEL_BUILD_TESTS)
   enable_testing()
+  add_executable(asmodel-embedding-tests tests/test_embedding.c)
+  target_link_libraries(asmodel-embedding-tests PRIVATE asmodel_static)
+  add_test(NAME asmodel-embedding COMMAND asmodel-embedding-tests)
   add_executable(asmodel-decode-tests tests/test_decode.c)
   target_include_directories(asmodel-decode-tests PRIVATE src)
   target_link_libraries(asmodel-decode-tests PRIVATE asmodel_static)
