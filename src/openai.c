@@ -28,16 +28,6 @@ typedef struct {
 
 typedef struct { char *p; size_t n, cap; } bytes;
 
-typedef enum {
-  SCHEMA_NONE = 0,
-  SCHEMA_STEP,
-  SCHEMA_CLASSIFY,
-  SCHEMA_JUDGE,
-  SCHEMA_ASPER_CURATION,
-  SCHEMA_ASPER_REVIEW,
-  SCHEMA_ASPER_RECALL
-} schema_kind;
-
 static char *odup(const char *s) {
   size_t n; char *p;
   if (!s) return NULL;
@@ -419,296 +409,10 @@ static int int_key(const char *json, const char *key) {
   return p ? (int)strtol(p, NULL, 10) : 0;
 }
 
-enum {
-  SF_WHY = 1u << 0,
-  SF_INPUT = 1u << 1,
-  SF_SUCCESS = 1u << 2,
-  SF_FALLBACK = 1u << 3
-};
-
-static schema_kind schema_for_grammar(const char *grammar) {
-  if (!grammar) return SCHEMA_NONE;
-  if (strstr(grammar, "root      ::= step") != NULL) return SCHEMA_STEP;
-  if (strstr(grammar, "root ::= \"CLASS \"") != NULL)
-    return SCHEMA_CLASSIFY;
-  if (strstr(grammar, "root ::= \"SCORE \"") != NULL)
-    return SCHEMA_JUDGE;
-  if (strstr(grammar, "root ::= noop | opline+") != NULL)
-    return SCHEMA_ASPER_CURATION;
-  if (strstr(grammar, "root ::= noop | revline+") != NULL ||
-      (strstr(grammar, "root ::= noop\n") != NULL &&
-       strstr(grammar, "noop ::= \"NOOP\"") != NULL))
-    return SCHEMA_ASPER_REVIEW;
-  if (strstr(grammar, "root ::= nomem |") != NULL)
-    return SCHEMA_ASPER_RECALL;
-  return SCHEMA_NONE;
-}
-
-static int schema_string_property(bytes *b, size_t max_len) {
-  char n[32];
-  snprintf(n, sizeof n, "%lu", (unsigned long)max_len);
-  return putsb(b, "{\"type\":\"string\",\"minLength\":1,\"maxLength\":") ||
-         putsb(b, n) || putsb(b, "}");
-}
-
-static int call_token_valid(const char *s, size_t n) {
-  size_t i;
-  int dot = 0;
-  if (n < 3 || s[0] < 'a' || s[0] > 'z') return 0;
-  for (i = 0; i < n; i++) {
-    unsigned char ch = (unsigned char)s[i];
-    if (ch == '.') dot = 1;
-    else if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-               (ch >= '0' && ch <= '9') || ch == '-' || ch == '@' ||
-               ch == '+'))
-      return 0;
-  }
-  return dot;
-}
-
-static int draft_forbidden_tool(const char *s, size_t n) {
-  static const char *const names[] = {
-      "fs.write", "edit.replace", "edit.insert", "edit.patch"
-  };
-  size_t i;
-  for (i = 0; i < sizeof names / sizeof names[0]; i++)
-    if (strlen(names[i]) == n && memcmp(s, names[i], n) == 0) return 1;
-  return 0;
-}
-
-static int schema_call_tool_property(bytes *b, const char *grammar,
-                                     int draft_mode) {
-  const char *p = grammar;
-  int first = 1;
-  if (putsb(b, "{\"type\":\"string\",\"enum\":[")) return -1;
-  while ((p = strstr(p, "::= \"")) != NULL) {
-    const char *end, *space;
-    size_t n;
-    p += 5;
-    end = strchr(p, '"');
-    if (!end) return -1;
-    space = (const char *)memchr(p, ' ', (size_t)(end - p));
-    if (!space) {
-      p = end + 1;
-      continue;
-    }
-    n = (size_t)(space - p);
-    if (call_token_valid(p, n) &&
-        !(draft_mode && draft_forbidden_tool(p, n))) {
-      if ((!first && putsb(b, ",")) || putsb(b, "\"") ||
-          putn(b, p, n) || putsb(b, "\""))
-        return -1;
-      first = 0;
-    }
-    p = end + 1;
-  }
-  if (first) return -1;
-  return putsb(b, "]}");
-}
-
-static int schema_step_variant(bytes *b, const char *action,
-                               unsigned fields, const char *grammar,
-                               int draft_mode) {
-  if (putsb(b, "{\"type\":\"object\",\"properties\":{\"action\":"
-               "{\"type\":\"string\",\"const\":") ||
-      json_string(b, action) || putsb(b, "}"))
-    return -1;
-  if (fields & SF_WHY) {
-    if (putsb(b, ",\"why\":") || schema_string_property(b, 512)) return -1;
-  }
-  if (fields & SF_INPUT) {
-    if (strcmp(action, "call") == 0) {
-      if (putsb(b, ",\"tool\":") ||
-          schema_call_tool_property(b, grammar, draft_mode) ||
-          putsb(b, ",\"arguments\":{\"type\":\"object\"}"))
-        return -1;
-    } else if (putsb(b, ",\"input\":") ||
-               schema_string_property(b, 2048)) {
-      return -1;
-    }
-  }
-  if (fields & SF_SUCCESS) {
-    if (putsb(b, ",\"success\":") || schema_string_property(b, 512))
-      return -1;
-  }
-  if (fields & SF_FALLBACK) {
-    if (putsb(b, ",\"fallback\":") || schema_string_property(b, 512))
-      return -1;
-  }
-  if (putsb(b, "},\"required\":[\"action\"")) return -1;
-  if ((fields & SF_WHY) && putsb(b, ",\"why\"")) return -1;
-  if (fields & SF_INPUT) {
-    if (strcmp(action, "call") == 0) {
-      if (putsb(b, ",\"tool\",\"arguments\"")) return -1;
-    } else if (putsb(b, ",\"input\"")) return -1;
-  }
-  if ((fields & SF_SUCCESS) && putsb(b, ",\"success\"")) return -1;
-  if ((fields & SF_FALLBACK) && putsb(b, ",\"fallback\"")) return -1;
-  return putsb(b, "],\"additionalProperties\":false}");
-}
-
-/* During a generate turn the action pass must select the destination, not
- * serialize the source code.  A dedicated object makes that boundary part
- * of constrained decoding; normalization below expands it to the internal
- * fs.write marker call consumed by asngn's private DRAFT phase. */
-static int schema_draft_write_variant(bytes *b) {
-  return putsb(b,
-      "{\"type\":\"object\",\"properties\":{" 
-      "\"action\":{\"type\":\"string\",\"const\":\"call\"},"
-      "\"why\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},"
-      "\"tool\":{\"type\":\"string\",\"const\":\"fs.write\"},"
-      "\"path\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},"
-      "\"success\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},"
-      "\"fallback\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512}},"
-      "\"required\":[\"action\",\"why\",\"tool\",\"path\",\"success\",\"fallback\"],"
-      "\"additionalProperties\":false}");
-}
-
-static int append_step_schema(bytes *b, const char *grammar, int draft_mode) {
-  int first = 1;
-#define ADD_VARIANT(name_, fields_) do {                                      \
-    if (!first && putsb(b, ",")) return -1;                                  \
-    if (schema_step_variant(b, (name_), (fields_), grammar, draft_mode))       \
-      return -1;                                                               \
-    first = 0;                                                                 \
-  } while (0)
-  if (putsb(b, "{\"oneOf\":[")) return -1;
-  if (draft_mode && strstr(grammar, "\"fs.write ") != NULL) {
-    if (schema_draft_write_variant(b)) return -1;
-    first = 0;
-  }
-  if (strstr(grammar, "\ncall      ::=") != NULL &&
-      (!draft_mode || strstr(grammar, "::= \"") != NULL))
-    ADD_VARIANT("call", SF_WHY | SF_INPUT | SF_SUCCESS | SF_FALLBACK);
-  if (strstr(grammar, "\nrecall    ::=") != NULL)
-    ADD_VARIANT("recall", SF_WHY | SF_INPUT | SF_SUCCESS | SF_FALLBACK);
-  if (strstr(grammar, "\nopen      ::=") != NULL)
-    ADD_VARIANT("open", SF_WHY | SF_INPUT);
-  ADD_VARIANT("think", SF_INPUT);
-  ADD_VARIANT("clarify", SF_WHY | SF_INPUT);
-  ADD_VARIANT("answer", 0);
-#undef ADD_VARIANT
-  return putsb(b, "]}");
-}
-
-static int append_asper_handles(bytes *b, const char *grammar) {
-  const char *p = strstr(grammar, "handle ::= ");
-  const char *end;
-  int first = 1;
-  if (!p) return -1;
-  end = strchr(p, '\n');
-  if (!end) end = p + strlen(p);
-  if (putsb(b, "(")) return -1;
-  while ((p = strchr(p, '"')) != NULL && p < end) {
-    const char *q = strchr(++p, '"');
-    if (!q || q > end) return -1;
-    if ((!first && putsb(b, "|")) || putn(b, p, (size_t)(q - p))) return -1;
-    first = 0;
-    p = q + 1;
-  }
-  return first ? -1 : putsb(b, ")");
-}
-
-static int append_asper_pattern(bytes *b, schema_kind kind,
-                                const char *grammar) {
-  int handles = strstr(grammar, "handle ::= ") != NULL;
-  if (kind == SCHEMA_ASPER_CURATION) {
-    if (putsb(b, "^(NOOP\\n|((INSERT (identity|context|project) \\| "
-                 "[^|\\n\\r]+")) return -1;
-    if (handles) {
-      if (putsb(b, "|(UPDATE|DEPRECATE) ") ||
-          append_asper_handles(b, grammar) ||
-          putsb(b, " \\| [^|\\n\\r]+")) return -1;
-    }
-    return putsb(b, ")\\n)+)$");
-  }
-  if (kind == SCHEMA_ASPER_REVIEW) {
-    if (!handles) return putsb(b, "^NOOP\\n$");
-    if (putsb(b, "^(NOOP\\n|((DEPRECATE ") ||
-        append_asper_handles(b, grammar) ||
-        putsb(b, " \\| [^|\\n\\r]+|KEEP ") ||
-        append_asper_handles(b, grammar) ||
-        putsb(b, ")\\n)+)$")) return -1;
-    return 0;
-  }
-  if (kind == SCHEMA_ASPER_RECALL) {
-    if (putsb(b, "^(NOMEM\\n|ANSWER \\| [^|\\n\\r]+\\n")) return -1;
-    if (handles) {
-      if (putsb(b, "(CITE ") || append_asper_handles(b, grammar) ||
-          putsb(b, "\\n)*")) return -1;
-    }
-    return putsb(b, ")$");
-  }
-  return -1;
-}
-
-static int append_asper_schema(bytes *b, schema_kind kind,
-                               const char *grammar) {
-  bytes pattern = {0};
-  int rc = -1;
-  if (append_asper_pattern(&pattern, kind, grammar)) goto done;
-  if (putsb(b, "{\"type\":\"object\",\"properties\":{"
-               "\"output\":{\"type\":\"string\",\"minLength\":5,"
-               "\"maxLength\":32768,\"pattern\":")) goto done;
-  if (json_string(b, pattern.p) ||
-      putsb(b, "}},\"required\":[\"output\"],"
-               "\"additionalProperties\":false}")) goto done;
-  rc = 0;
-done:
-  free(pattern.p);
-  return rc;
-}
-
-static int append_schema(bytes *body, schema_kind kind, const char *grammar,
-                         int draft_mode) {
-  if (kind == SCHEMA_STEP) {
-    if (append_step_schema(body, grammar, draft_mode)) return -1;
-  } else if (kind == SCHEMA_CLASSIFY) {
-    if (putsb(body,
-        "{\"type\":\"object\",\"properties\":{" 
-        "\"class\":{\"type\":\"string\",\"enum\":[\"SIMPLE\",\"MODERATE\",\"COMPLEX\"]},"
-        "\"detail\":{\"type\":\"string\",\"enum\":[\"TERSE\",\"NORMAL\",\"RICH\"]},"
-        "\"mode\":{\"type\":\"string\",\"enum\":[\"DIRECT\",\"PLAN\"]},"
-        "\"task\":{\"type\":\"string\",\"enum\":[\"CHAT\",\"LOOKUP\",\"EXPLAIN\",\"EDIT\",\"BUILD\",\"GENERATE\",\"REFACTOR\",\"DEBUG\"]}},"
-        "\"required\":[\"class\",\"detail\",\"mode\",\"task\"],"
-        "\"additionalProperties\":false}")) return -1;
-  } else if (kind == SCHEMA_JUDGE) {
-    if (putsb(body,
-        "{\"type\":\"object\",\"properties\":{" 
-        "\"score\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10},"
-        "\"critique\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512}},"
-        "\"required\":[\"score\",\"critique\"],"
-        "\"additionalProperties\":false}")) return -1;
-  } else if (kind == SCHEMA_ASPER_CURATION ||
-             kind == SCHEMA_ASPER_REVIEW ||
-             kind == SCHEMA_ASPER_RECALL) {
-    if (append_asper_schema(body, kind, grammar)) return -1;
-  } else {
-    return -1;
-  }
-  return 0;
-}
-
-static int append_response_format(bytes *body, schema_kind kind,
-                                  const char *grammar, int draft_mode) {
-  if (putsb(body, ",\"response_format\":{\"type\":\"json_schema\","
-                  "\"json_schema\":{\"name\":\"asmodel_constrained\","
-                  "\"strict\":true,\"schema\":"))
-    return -1;
-  if (append_schema(body, kind, grammar, draft_mode)) return -1;
-  return putsb(body, "}}");
-}
-
-static int put_legacy_quoted(bytes *b, const char *s) {
-  const unsigned char *p = (const unsigned char *)s;
-  if (!s || !s[0] || putsb(b, "\"")) return -1;
-  while (*p) {
-    char ch = (char)*p++;
-    if (ch == '"' || ch == '\\') ch = '\'';
-    else if (ch == '\r' || ch == '\n') ch = ' ';
-    if (putn(b, &ch, 1)) return -1;
-  }
-  return putsb(b, "\"");
+static int append_response_format(bytes *body, const char *schema) {
+  return putsb(body, ",\"response_format\":{\"type\":\"json_schema\","
+      "\"json_schema\":{\"name\":\"asmodel_output\",\"strict\":true,\"schema\":") ||
+      putsb(body, schema) || putsb(body, "}}");
 }
 
 static char *json_value_string(const char *json, const char *key) {
@@ -750,151 +454,6 @@ static char *json_value_object(const char *json, const char *key) {
       if (depth < 0) return NULL;
     }
   }
-  return NULL;
-}
-
-static int put_xcdn_string(bytes *b, const char *s) {
-  const unsigned char *p = (const unsigned char *)(s ? s : "");
-  if (putsb(b, "\"")) return -1;
-  while (*p) {
-    char esc[7];
-    switch (*p) {
-    case '"': if (putsb(b, "\\\"")) return -1; break;
-    case '\\': if (putsb(b, "\\\\")) return -1; break;
-    case '\n': if (putsb(b, "\\n")) return -1; break;
-    case '\r': if (putsb(b, "\\r")) return -1; break;
-    case '\t': if (putsb(b, "\\t")) return -1; break;
-    default:
-      if (*p < 0x20) {
-        snprintf(esc, sizeof esc, "\\u%04x", (unsigned)*p);
-        if (putn(b, esc, 6)) return -1;
-      } else if (putn(b, (const char *)p, 1)) return -1;
-      break;
-    }
-    p++;
-  }
-  return putsb(b, "\"");
-}
-
-static char *normalize_step_json(const char *json, int draft_mode) {
-  char *action = NULL, *why = NULL, *input = NULL;
-  char *tool = NULL, *arguments = NULL, *path = NULL;
-  char *success = NULL, *fallback = NULL;
-  unsigned fields = 0;
-  bytes b = {0};
-  int call = 0;
-  action = json_value_string(json, "action");
-  if (!action) goto fail;
-  if (strcmp(action, "answer") == 0) fields = 0;
-  else if (strcmp(action, "think") == 0) fields = SF_INPUT;
-  else if (strcmp(action, "clarify") == 0 || strcmp(action, "open") == 0)
-    fields = SF_WHY | SF_INPUT;
-  else if (strcmp(action, "recall") == 0)
-    fields = SF_WHY | SF_INPUT | SF_SUCCESS | SF_FALLBACK;
-  else if (strcmp(action, "call") == 0) {
-    fields = SF_WHY | SF_INPUT | SF_SUCCESS | SF_FALLBACK;
-    call = 1;
-  } else goto fail;
-  if (fields & SF_WHY) why = json_value_string(json, "why");
-  if (fields & SF_INPUT) {
-    if (call) {
-      tool = json_value_string(json, "tool");
-      arguments = json_value_object(json, "arguments");
-      if (draft_mode && tool && strcmp(tool, "fs.write") == 0 && !arguments)
-        path = json_value_string(json, "path");
-    } else {
-      input = json_value_string(json, "input");
-    }
-  }
-  if (fields & SF_SUCCESS) success = json_value_string(json, "success");
-  if (fields & SF_FALLBACK) fallback = json_value_string(json, "fallback");
-  if (((fields & SF_WHY) && !why) ||
-      ((fields & SF_INPUT) &&
-       (call ? (!tool || (!arguments && !path)) : !input)) ||
-      ((fields & SF_SUCCESS) && !success) ||
-      ((fields & SF_FALLBACK) && !fallback)) goto fail;
-  if (putsb(&b, "{action: ") || put_legacy_quoted(&b, action)) goto fail;
-  if (fields & SF_WHY) {
-    if (putsb(&b, ", why: ") || put_legacy_quoted(&b, why)) goto fail;
-  }
-  if (fields & SF_INPUT) {
-    if (putsb(&b, ", input: ")) goto fail;
-    if (call) {
-      const char *p;
-      if (putsb(&b, tool) || putsb(&b, " ")) goto fail;
-      if (path) {
-        if (putsb(&b, "{path: ") || put_xcdn_string(&b, path) ||
-            putsb(&b, ", content: \"@asngn:draft\"}")) goto fail;
-      } else {
-        for (p = arguments; *p; ++p) {
-          char ch = (*p == '\r' || *p == '\n') ? ' ' : *p;
-          if (putn(&b, &ch, 1)) goto fail;
-        }
-      }
-    } else if (put_legacy_quoted(&b, input)) goto fail;
-  }
-  if (fields & SF_SUCCESS) {
-    if (putsb(&b, ", success: ") || put_legacy_quoted(&b, success)) goto fail;
-  }
-  if (fields & SF_FALLBACK) {
-    if (putsb(&b, ", fallback: ") || put_legacy_quoted(&b, fallback)) goto fail;
-  }
-  if (putsb(&b, "}\n")) goto fail;
-  free(action); free(why); free(input); free(tool); free(arguments); free(path);
-  free(success); free(fallback);
-  return b.p;
-fail:
-  free(action); free(why); free(input); free(tool); free(arguments); free(path);
-  free(success); free(fallback);
-  free(b.p);
-  return NULL;
-}
-
-static char *normalize_schema_json(schema_kind kind, const char *json,
-                                   int draft_mode) {
-  bytes b = {0};
-  char *a = NULL, *d = NULL, *m = NULL, *task = NULL, *crit = NULL;
-  const char *score_p;
-  int score;
-  if (kind == SCHEMA_STEP) return normalize_step_json(json, draft_mode);
-  if (kind == SCHEMA_ASPER_CURATION ||
-      kind == SCHEMA_ASPER_REVIEW ||
-      kind == SCHEMA_ASPER_RECALL)
-    return json_value_string(json, "output");
-  if (kind == SCHEMA_CLASSIFY) {
-    a = json_value_string(json, "class");
-    d = json_value_string(json, "detail");
-    m = json_value_string(json, "mode");
-    task = json_value_string(json, "task");
-    if (!a || !d || !m || !task || putsb(&b, "CLASS ") || putsb(&b, a) ||
-        putsb(&b, " | DETAIL ") || putsb(&b, d) ||
-        putsb(&b, " | MODE ") || putsb(&b, m) ||
-        putsb(&b, " | TASK ") || putsb(&b, task) || putsb(&b, "\n"))
-      goto fail;
-  } else if (kind == SCHEMA_JUDGE) {
-    score_p = find_key(json, "score");
-    crit = json_value_string(json, "critique");
-    if (!score_p || !crit) goto fail;
-    score = (int)strtol(score_p, NULL, 10);
-    if (score < 0 || score > 10 || putsb(&b, "SCORE ")) goto fail;
-    {
-      char n[16];
-      snprintf(n, sizeof n, "%d", score);
-      if (putsb(&b, n) || putsb(&b, " | ")) goto fail;
-    }
-    {
-      const char *p;
-      for (p = crit; *p; ++p) {
-        char ch = (*p == '|' || *p == '\r' || *p == '\n') ? ' ' : *p;
-        if (putn(&b, &ch, 1)) goto fail;
-      }
-      if (putsb(&b, "\n")) goto fail;
-    }
-  } else goto fail;
-  free(a); free(d); free(m); free(task); free(crit);
-  return b.p;
-fail:
-  free(a); free(d); free(m); free(task); free(crit); free(b.p);
   return NULL;
 }
 
@@ -1084,18 +643,6 @@ static int append_reasoning_responses(bytes *body, oai_provider *u,
          json_string(body, effort) || putsb(body, "}");
 }
 
-static char *responses_function_arguments(const char *json) {
-  const char *call = strstr(json, "\"function_call\"");
-  const char *p;
-  char *out;
-  if (!call) call = json;
-  p = find_key(call, "arguments");
-  if (!p) return NULL;
-  out = decode_json_string(p);
-  if (out) return out;
-  return json_value_object(call, "arguments");
-}
-
 static char *responses_output_text(const char *json) {
   const char *item = strstr(json, "\"output_text\"");
   const char *p;
@@ -1106,9 +653,7 @@ static char *responses_output_text(const char *json) {
 
 static int build_lmstudio_responses(bytes *body, oai_provider *u,
                                     const char *sys, const char *user,
-                                    const char *grammar,
                                     const asmodel_generate_params *params,
-                                    schema_kind skind, int draft_mode,
                                     asmodel_reasoning_mode reasoning) {
   char n[160];
   if (putsb(body, "{\"model\":") || json_string(body, u->model) ||
@@ -1123,21 +668,24 @@ static int build_lmstudio_responses(bytes *body, oai_provider *u,
       append_reasoning_responses(body, u, reasoning,
                                  params->reasoning_budget))
     return -1;
-  if (skind != SCHEMA_NONE) {
-    if (putsb(body,
-              ",\"tools\":[{\"type\":\"function\","
-              "\"name\":\"asmodel_emit\","
-              "\"description\":\"Emit the required constrained value\","
-              "\"parameters\":"))
-      return -1;
-    if (append_schema(body, skind, grammar, draft_mode) ||
-        putsb(body,
-              ",\"strict\":true}],\"tool_choice\":\"required\""))
-      return -1;
-    u->last_generation.applied |= ASMODEL_APPLIED_CONSTRAINT;
-  }
   if (putsb(body, ",\"store\":false")) return -1;
   return putsb(body, "}");
+}
+
+/* Until a verified tokenizer is available, count every UTF-8 byte plus a
+ * template reserve. Include schemas that may be injected by the server. */
+static int request_fits(int context, int output, const char *sys,
+                        const char *user, const char *schema) {
+  if (context <= 0) return 1;
+  if (output < 0 || output > context || context-output < 256) return 0;
+  size_t left = (size_t)(context-output-256);
+  const char *parts[] = {sys, user, schema};
+  for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
+    size_t n = parts[i] ? strlen(parts[i]) : 0;
+    if (n > left) return 0;
+    left -= n;
+  }
+  return 1;
 }
 
 static int oai_generate(void *ud, const char *sys, const char *user,
@@ -1151,25 +699,29 @@ static int oai_generate(void *ud, const char *sys, const char *user,
   char num[128], error[256] = {0};
   const char *content;
   char *finish = NULL;
-  schema_kind skind = SCHEMA_NONE;
+  const char *schema = params->output_schema;
   asmodel_reasoning_mode reasoning;
   int use_responses = 0;
   int stream_chat = 0;
   int hit_length = 0;
-  /* The short content marker is retained in the CALL evidence after the
-   * write. Only the explicit instruction sentinel means that this pass may
-   * choose a new draft write; otherwise a later decision could try to write
-   * the already-created artifact again. */
-  int draft_mode = user && strstr(user, "@asngn:draft-mode") != NULL;
   int rc = ASMODEL_ERR_BACKEND;
   *out_text = NULL;
   u->last_error[0] = '\0';
   memset(&u->last_generation, 0, sizeof u->last_generation);
   u->last_generation.finish_reason = ASMODEL_FINISH_ERROR;
+  u->last_generation.usage_known = 1; /* No request has been dispatched yet. */
+  const char *counted_schema = schema && (u->caps.flags & ASMODEL_CAP_JSON_SCHEMA) &&
+      !(grammar && u->remote_provider == ASMODEL_REMOTE_LLAMA_SERVER) ? schema : NULL;
+  if (!request_fits(u->caps.context_tokens, params->max_tokens, sys, user, counted_schema)) {
+    snprintf(u->last_error, sizeof u->last_error,
+             "estimated request including output schema exceeds context budget");
+    rc = ASMODEL_ERR_LIMIT;
+    goto done;
+  }
   reasoning = effective_reasoning(u, params);
-  if (grammar) skind = schema_for_grammar(grammar);
-  if (grammar && params->require_constraint && skind == SCHEMA_NONE &&
-      !(u->caps.flags & ASMODEL_CAP_GBNF)) {
+  if (params->require_constraint &&
+      !((grammar && (u->caps.flags & ASMODEL_CAP_GBNF)) ||
+        (schema && (u->caps.flags & ASMODEL_CAP_JSON_SCHEMA)))) {
     snprintf(u->last_error, sizeof u->last_error,
              "provider profile cannot enforce the requested constraint");
     rc = ASMODEL_ERR_UNSUPPORTED;
@@ -1179,16 +731,9 @@ static int oai_generate(void *ud, const char *sys, const char *user,
    * 200.  For constrained LM Studio calls, JSON Schema is enforced by the
    * decoder and is therefore the stronger contract. */
   use_responses = u->remote_provider == ASMODEL_REMOTE_LMSTUDIO &&
-                  reasoning != ASMODEL_REASONING_DEFAULT && grammar == NULL;
+                  reasoning != ASMODEL_REASONING_DEFAULT && grammar == NULL && schema == NULL;
   if (use_responses) {
-    if (grammar && skind == SCHEMA_NONE) {
-      snprintf(u->last_error, sizeof u->last_error,
-               "LM Studio Responses requires a recognized action schema");
-      rc = ASMODEL_ERR_UNSUPPORTED;
-      goto done;
-    }
-    if (build_lmstudio_responses(&body, u, sys, user, grammar, params,
-                                 skind, draft_mode, reasoning)) {
+    if (build_lmstudio_responses(&body, u, sys, user, params, reasoning)) {
       snprintf(u->last_error, sizeof u->last_error,
                "LM Studio profile cannot apply the requested controls");
       rc = ASMODEL_ERR_UNSUPPORTED;
@@ -1220,29 +765,19 @@ static int oai_generate(void *ud, const char *sys, const char *user,
       rc = ASMODEL_ERR_UNSUPPORTED;
       goto done;
     }
-    if (grammar) {
-      if (u->remote_provider == ASMODEL_REMOTE_LMSTUDIO ||
-          (u->remote_provider == ASMODEL_REMOTE_VLLM && skind != SCHEMA_NONE)) {
-        if (skind == SCHEMA_NONE ||
-            append_response_format(&body, skind, grammar, draft_mode)) {
-          snprintf(u->last_error, sizeof u->last_error,
-                   "provider profile cannot translate the requested schema");
-          rc = ASMODEL_ERR_UNSUPPORTED;
-          goto done;
-        }
-      } else if (u->remote_provider == ASMODEL_REMOTE_VLLM) {
+    if (schema && (u->caps.flags & ASMODEL_CAP_JSON_SCHEMA) &&
+        !(grammar && u->remote_provider == ASMODEL_REMOTE_LLAMA_SERVER)) {
+      if (append_response_format(&body, schema)) goto done;
+      u->last_generation.json_output = 1;
+      u->last_generation.applied |= ASMODEL_APPLIED_CONSTRAINT;
+    } else if (grammar && (u->caps.flags & ASMODEL_CAP_GBNF)) {
+      if (u->remote_provider == ASMODEL_REMOTE_VLLM) {
         if (putsb(&body, ",\"structured_outputs\":{\"grammar\":" ) ||
             json_string(&body, grammar) || putsb(&body, "}")) goto done;
-      } else if (u->remote_provider == ASMODEL_REMOTE_LLAMA_SERVER) {
-        if (putsb(&body, ",\"grammar\":" ) ||
-            json_string(&body, grammar) ||
+      } else {
+        if (putsb(&body, ",\"grammar\":" ) || json_string(&body, grammar) ||
             putsb(&body, ",\"cache_prompt\":true")) goto done;
         u->last_generation.applied |= ASMODEL_APPLIED_PREFIX_CACHE;
-      } else if (params->require_constraint) {
-        snprintf(u->last_error, sizeof u->last_error,
-                 "generic OpenAI profile cannot guarantee constrained output");
-        rc = ASMODEL_ERR_UNSUPPORTED;
-        goto done;
       }
       u->last_generation.applied |= ASMODEL_APPLIED_CONSTRAINT;
     }
@@ -1253,6 +788,7 @@ static int oai_generate(void *ud, const char *sys, const char *user,
     if (putsb(&body, "}")) goto done;
   }
   {
+    u->last_generation.usage_known = 0;
     int http_rc = post_json(
         u, use_responses ? "/responses" : "/chat/completions", body.p,
         cancel, &reply, stream_chat ? token_fn : NULL, token_ud,
@@ -1323,13 +859,7 @@ static int oai_generate(void *ud, const char *sys, const char *user,
              out_gen ? *out_gen : 0, params->max_tokens);
     rc = ASMODEL_ERR_LIMIT;
   }
-  if (use_responses && skind != SCHEMA_NONE) {
-    char *arguments = responses_function_arguments(reply.p);
-    if (arguments) {
-      *out_text = normalize_schema_json(skind, arguments, draft_mode);
-      free(arguments);
-    }
-  } else if (use_responses) {
+  if (use_responses) {
     *out_text = responses_output_text(reply.p);
   } else {
     content = find_key(reply.p, "content");
@@ -1339,17 +869,6 @@ static int oai_generate(void *ud, const char *sys, const char *user,
     snprintf(u->last_error, sizeof u->last_error,
              "response has no valid assistant output");
     goto done;
-  }
-  if (!hit_length && !use_responses && skind != SCHEMA_NONE &&
-      (u->last_generation.applied & ASMODEL_APPLIED_CONSTRAINT)) {
-    char *normalized = normalize_schema_json(skind, *out_text, draft_mode);
-    free(*out_text);
-    *out_text = normalized;
-    if (!*out_text) {
-      snprintf(u->last_error, sizeof u->last_error,
-               "assistant content violates the constrained decision schema");
-      goto done;
-    }
   }
   if (token_fn) token_fn(*out_text, strlen(*out_text), token_ud);
   if (!hit_length) {

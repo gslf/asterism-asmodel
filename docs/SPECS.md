@@ -78,7 +78,7 @@ creates silent quality failures.
 
 | Profile | Structured output | Reasoning control | Prompt reuse |
 |---|---|---|---|
-| llama.cpp server | Native GBNF and JSON Schema | Explicitly disabled for constrained micro-passes | `cache_prompt` |
+| llama.cpp server | Native GBNF and JSON Schema | Requests reasoning off; validates available usage | `cache_prompt` |
 | LM Studio | Chat Completions JSON Schema | Disabled on the verified profile | Server-managed cache |
 | vLLM | JSON Schema and grammar through `structured_outputs` | Disabled on the verified profile | Server-managed cache |
 | Generic | Plain text only | No guarantee | No guarantee |
@@ -215,3 +215,14 @@ capabilities, generation metadata and statistics.
 Configuration examples and build instructions belong in the repository README.
 Provider additions belong behind a new explicit profile with capability tests;
 they must not broaden the generic profile by assumption.
+
+
+### Output contract ownership (ABI 4)
+
+Callers supply `output_schema` explicitly alongside any alternative free GBNF.
+The provider chooses a supported encoding and reports `json_output`; it does not
+infer semantics from grammar text or normalize application objects. Asngn owns
+its action/classification/judge contracts. Asper owns curation/review/recall
+contracts. Tool argument schemas come from Astools' typed manifests. Complete
+JSON values are validated at their owning application boundary. Multimodal
+messages and native tool-call history remain future parts of the request IR.

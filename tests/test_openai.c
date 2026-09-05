@@ -28,19 +28,9 @@ int main(int argc, char **argv) {
   asmodel_generate_params params;
   asmodel_capabilities caps;
   asmodel_generation_info info;
-  const char *classify_grammar =
-      "root ::= \"CLASS \" class \" | DETAIL \" detail "
-      "\" | MODE \" mode \" | TASK \" task \"\\n\"\n";
-  const char *curation_grammar =
-      "root ::= noop | opline+\n"
-      "opline ::= insert | update | deprecate\n"
-      "noop ::= \"NOOP\" \"\\n\"\n"
-      "insert ::= \"INSERT \" (\"identity\" | \"context\" | \"project\") "
-      "\" | \" text \"\\n\"\n"
-      "update ::= \"UPDATE \" handle \" | \" text \"\\n\"\n"
-      "deprecate ::= \"DEPRECATE \" handle \" | \" text \"\\n\"\n"
-      "handle ::= \"M1\" | \"M2\"\n"
-      "text ::= [^|\\n\\r]+\n";
+  const char *classify_grammar = "unrelated ::= \"opaque\"\n";
+  const char *classify_schema = "{\"type\":\"object\",\"properties\":{\"class\":{\"type\":\"string\",\"enum\":[\"SIMPLE\",\"MODERATE\",\"COMPLEX\"]},\"detail\":{\"type\":\"string\",\"enum\":[\"TERSE\",\"NORMAL\",\"RICH\"]},\"mode\":{\"type\":\"string\",\"enum\":[\"DIRECT\",\"PLAN\"]},\"task\":{\"type\":\"string\",\"enum\":[\"CHAT\",\"LOOKUP\",\"EXPLAIN\",\"EDIT\",\"BUILD\",\"GENERATE\",\"REFACTOR\",\"DEBUG\"]}},\"required\":[\"class\",\"detail\",\"mode\",\"task\"],\"additionalProperties\":false}";
+  const char *curation_schema = "{\"type\":\"object\",\"properties\":{\"output\":{\"type\":\"string\",\"pattern\":\"^NOOP\\\\n$\"}},\"required\":[\"output\"],\"additionalProperties\":false}";
   char error[256] = {0}, *text = NULL;
   int prompt_tokens = 0, generated_tokens = 0;
   float vector[3] = {0};
@@ -129,6 +119,10 @@ int main(int argc, char **argv) {
       !(caps.flags & ASMODEL_CAP_REASONING_OFF))
     return 9;
   text = NULL;
+  /* No schema is inferred even if an application-like grammar is supplied. */
+  if (lmstudio.generate(lmstudio.userdata, "system", "user", classify_grammar,
+      &params, NULL, NULL, NULL, &text, NULL, NULL) != ASMODEL_ERR_UNSUPPORTED) return 23;
+  params.output_schema = classify_schema;
   heartbeats = 0;
   output_callbacks = 0;
   if (lmstudio.generate(lmstudio.userdata, "system", "user",
@@ -136,29 +130,29 @@ int main(int argc, char **argv) {
                         &text, &prompt_tokens, &generated_tokens) !=
           ASMODEL_OK ||
       !text || strcmp(text,
-          "CLASS COMPLEX | DETAIL NORMAL | MODE PLAN | TASK DEBUG\n") != 0 ||
+          "{\"class\": \"COMPLEX\", \"detail\": \"NORMAL\", \"mode\": \"PLAN\", \"task\": \"DEBUG\"}") != 0 ||
       prompt_tokens != 13 || generated_tokens != 7 || heartbeats < 1 ||
       output_callbacks != 1)
     return 10;
   free(text);
   if (asmodel_provider_last_generation_info(&lmstudio, &info) != 0 ||
-      info.finish_reason != ASMODEL_FINISH_STOP ||
+      info.finish_reason != ASMODEL_FINISH_STOP || !info.json_output ||
       !(info.applied & ASMODEL_APPLIED_REASONING_OFF) ||
       !(info.applied & ASMODEL_APPLIED_CONSTRAINT) ||
       info.reasoning_tokens != 0)
     return 11;
 
-  /* LM Studio cannot consume arbitrary GBNF. The adapter translates the
-   * Asper line protocol to JSON Schema and unwraps its output field back to
-   * the exact text expected by Asper. Reasoning usage is optional here. */
+  /* The adapter preserves the caller's JSON object without unwrapping it. */
+  params.output_schema = curation_schema;
   text = NULL;
   if (lmstudio.generate(lmstudio.userdata, "system", "user",
-                        curation_grammar, &params, NULL, NULL, NULL,
+                        classify_grammar, &params, NULL, NULL, NULL,
                         &text, &prompt_tokens, &generated_tokens) !=
-          ASMODEL_OK || !text || strcmp(text, "NOOP\n") != 0)
+          ASMODEL_OK || !text || strcmp(text, "{\"output\": \"NOOP\\n\"}") != 0)
     return 22;
   free(text);
 
+  params.output_schema = classify_schema;
   spec.remote_provider = ASMODEL_REMOTE_VLLM;
   spec.remote_model = "vllm-model";
   memset(&vllm, 0, sizeof vllm);
@@ -172,7 +166,7 @@ int main(int argc, char **argv) {
                     &params, capture_token, NULL, NULL, &text, &prompt_tokens,
                     &generated_tokens) != ASMODEL_OK ||
       !text || strcmp(text,
-          "CLASS MODERATE | DETAIL TERSE | MODE DIRECT | TASK EXPLAIN\n") != 0 ||
+          "{\"class\": \"MODERATE\", \"detail\": \"TERSE\", \"mode\": \"DIRECT\", \"task\": \"EXPLAIN\"}") != 0 ||
       heartbeats < 1 || output_callbacks != 1)
     return 13;
   free(text);
@@ -194,6 +188,7 @@ int main(int argc, char **argv) {
     return 15;
   free(text);
 
+  params.output_schema = NULL;
   spec.remote_provider = ASMODEL_REMOTE_GENERIC;
   spec.remote_model = "generic-model";
   memset(&generic, 0, sizeof generic);
@@ -221,6 +216,18 @@ int main(int argc, char **argv) {
       fabsf(vector[1]) > 0.0001f ||
       fabsf(vector[2] - 0.8f) > 0.0001f)
     return 7;
+  /* Admission accounts for schemas before spending any remote inference. */
+  asmodel_provider bounded;
+  spec.embedding = 0; spec.context_tokens = 300; spec.remote_model = "budget-model";
+  spec.remote_provider = ASMODEL_REMOTE_LMSTUDIO;
+  if (asmodel_openai_provider_create(&spec, &bounded, error, sizeof error)) return 24;
+  params.max_tokens = 1; params.output_schema = classify_schema;
+  text = NULL;
+  if (bounded.generate(bounded.userdata, "", "", NULL, &params, NULL, NULL,
+      NULL, &text, NULL, NULL) != ASMODEL_ERR_LIMIT || text) return 25;
+  if (asmodel_provider_last_generation_info(&bounded, &info) || !info.usage_known)
+    return 26;
+  bounded.destroy(bounded.userdata);
   provider.destroy(provider.userdata);
   lmstudio.destroy(lmstudio.userdata);
   vllm.destroy(vllm.userdata);

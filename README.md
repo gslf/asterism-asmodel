@@ -14,14 +14,14 @@ the same implementation:
 
 | `remote_provider` | Constrained output | Per-call reasoning control | Reuse |
 |---|---|---|---|
-| `LLAMA_SERVER` | native GBNF / JSON Schema | guaranteed OFF; a GBNF micro-pass cannot emit reasoning | `cache_prompt` |
+| `LLAMA_SERVER` | native GBNF / JSON Schema | requests OFF; GBNF constrains emitted text | `cache_prompt` |
 | `LMSTUDIO` | Chat Completions JSON Schema | requests OFF; check returned usage | server-managed cache |
 | `VLLM` | JSON Schema or `structured_outputs.grammar` | requests OFF; validate the deployed server | server-managed cache |
 | `GENERIC` / unresolved `AUTO` | text only | none guaranteed | none guaranteed |
 
 Generation policy is a per-request contract through
 `asmodel_generate_params`: `reasoning`, `reasoning_budget`, and
-`require_constraint`. Unsupported combinations return
+`require_constraint`, and optional `output_schema`. Unsupported combinations return
 `ASMODEL_ERR_UNSUPPORTED` before inference; a server-reported length stop
 returns `ASMODEL_ERR_LIMIT`. The runtime never retries or silently drops a
 constraint. `asmodel_capabilities` and `asmodel_generation_info` expose the
@@ -47,7 +47,7 @@ ctest --test-dir build --output-on-failure
 
 See `include/asmodel.h` for the stable C API.
 
-## Accounting contract (ABI 3)
+## Accounting contract (ABI 4)
 
 `asmodel_provider_measure_prompt` distinguishes exact, estimated and unavailable
 counts. Exact status requires a successful template-aware callback and tokenizer
@@ -60,3 +60,22 @@ Queue/load time is deducted from the request duration before backend dispatch;
 generation queue waits observe cancellation and deadlines. Native model loading
 itself still runs under the manager lock and cannot yet be interrupted; a backend
 must cooperate to bound time spent inside its loader or inference callback.
+
+
+## Explicit output contracts
+
+`output_schema` is caller-owned JSON Schema. The optional GBNF argument is an
+alternative representation of the same application contract. llama-server uses
+GBNF when supplied; LM Studio uses JSON Schema; vLLM prefers the supplied schema.
+A required constraint with no supported representation fails before dispatch.
+The provider never examines grammar productions to identify an action, judge,
+classifier or memory operation, and never unwraps or rewrites application JSON.
+`result_info.json_output` identifies the selected representation. Applications
+must validate and interpret the returned value, including complete-but-invalid
+provider responses. This is the output-contract part of the planned IR; role/block
+messages, attachments and native tool-call history are not implemented yet.
+
+Remote admission includes the selected schema in its conservative byte estimate.
+Requests rejected before HTTP dispatch report known zero consumption. Declared
+capability profiles are adapter contracts, not evidence that a particular server,
+model and template combination has passed real-provider conformance tests.

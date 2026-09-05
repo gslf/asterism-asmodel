@@ -9,8 +9,8 @@ extern "C" {
 #endif
 
 #define ASMODEL_VERSION_MAJOR 0
-#define ASMODEL_VERSION_MINOR 3
-#define ASMODEL_ABI_VERSION 3
+#define ASMODEL_VERSION_MINOR 4
+#define ASMODEL_ABI_VERSION 4
 #define ASMODEL_VERSION_PATCH 0
 #define ASMODEL_ID_MAX 64
 
@@ -96,6 +96,7 @@ typedef struct {
   int reasoning_tokens;
   int cached_input_tokens;
   int usage_known; /* zero means unknown, not zero consumption */
+  int json_output; /* selected JSON Schema; caller interprets the returned value */
   char error[512]; /* per-request provider diagnostic */
 } asmodel_generation_info;
 
@@ -145,6 +146,10 @@ typedef struct {
   asmodel_reasoning_mode reasoning;
   int reasoning_budget;
   int require_constraint;
+  /* Caller-owned JSON Schema for the same output contract as the optional
+   * GBNF argument. Providers select a supported representation; they never
+   * infer application semantics from grammar text. NULL means no JSON form. */
+  const char *output_schema;
   asmodel_generation_info *result_info; /* optional per-request result */
 } asmodel_generate_params;
 

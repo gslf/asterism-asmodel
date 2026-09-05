@@ -166,7 +166,7 @@ static asmodel_err ensure_loaded(asmodel_manager *m, model_slot *s) {
 }
 
 unsigned asmodel_abi_version(void) { return ASMODEL_ABI_VERSION; }
-const char *asmodel_version(void) { return "0.3.0"; }
+const char *asmodel_version(void) { return "0.4.0"; }
 
 const char *asmodel_err_name(asmodel_err e) {
   switch (e) {
