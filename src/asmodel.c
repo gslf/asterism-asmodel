@@ -145,7 +145,8 @@ static asmodel_err ensure_loaded(asmodel_manager *m, model_slot *s) {
   return ASMODEL_OK;
 }
 
-const char *asmodel_version(void) { return "0.2.0"; }
+unsigned asmodel_abi_version(void) { return ASMODEL_ABI_VERSION; }
+const char *asmodel_version(void) { return "0.3.0"; }
 
 const char *asmodel_err_name(asmodel_err e) {
   switch (e) {
@@ -324,19 +325,35 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
   asmodel_err e;
   int rc;
   char detail[384] = {0};
+  asmodel_generate_params remaining;
+  int64_t started = mono_ms();
   if (!m || !id || !params || !out_text) return ASMODEL_ERR_INVALID;
   *out_text = NULL;
+  if (out_in) *out_in = 0;
+  if (out_gen) *out_gen = 0;
+  if (params->result_info) memset(params->result_info, 0, sizeof *params->result_info);
+  if (cancel && *cancel) return ASMODEL_ERR_CANCELLED;
   e = begin_call(m, id, &s);
   if (e != ASMODEL_OK) return e;
+  remaining = *params;
+  if (params->deadline_ms > 0) {
+    remaining.deadline_ms -= mono_ms() - started;
+    if (remaining.deadline_ms <= 0) { end_call(m, s); return ASMODEL_ERR_TIMEOUT; }
+  }
+  if (cancel && *cancel) { end_call(m, s); return ASMODEL_ERR_CANCELLED; }
   rc = s->provider.generate ?
-      s->provider.generate(s->provider.userdata, sys, user, grammar, params,
+      s->provider.generate(s->provider.userdata, sys, user, grammar, &remaining,
                            token_fn, token_ud, cancel, out_text, out_in, out_gen)
       : -1;
+  if (params->result_info && s->provider.last_generation_info)
+    (void)s->provider.last_generation_info(s->provider.userdata, params->result_info);
   if (rc != ASMODEL_OK && s->provider.last_error) {
     const char *provider_error = s->provider.last_error(s->provider.userdata);
     if (provider_error && provider_error[0])
       snprintf(detail, sizeof detail, "%s", provider_error);
   }
+  if (params->result_info && detail[0])
+    snprintf(params->result_info->error, sizeof params->result_info->error, "%s", detail);
   end_call(m, s);
   if (cancel && *cancel) return ASMODEL_ERR_CANCELLED;
   if (rc == ASMODEL_OK) return ASMODEL_OK;
@@ -384,12 +401,7 @@ int asmodel_count_prompt_tokens(asmodel_manager *m, const char *id,
   if (!m || !id) return -1;
   e = begin_call(m, id, &s);
   if (e != ASMODEL_OK) return -1;
-  if (s->provider.count_prompt_tokens)
-    n = s->provider.count_prompt_tokens(s->provider.userdata, sys, user);
-  else if (s->provider.count_tokens)
-    n = s->provider.count_tokens(s->provider.userdata, sys) +
-        s->provider.count_tokens(s->provider.userdata, user) + 16;
-  else n = -1;
+  n = asmodel_provider_measure_prompt(&s->provider, sys, user).admission_tokens;
   end_call(m, s);
   return n;
 }

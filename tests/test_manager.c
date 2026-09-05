@@ -40,6 +40,10 @@ static int load(void *ud, const asmodel_spec *spec, asmodel_provider *out,
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s:%d: %s\n", __FILE__, __LINE__, #x); return 1; } } while (0)
 
+static int count_prompt(void *ud, const char *sys, const char *user) {
+  (void)ud; (void)sys; (void)user; return 7;
+}
+
 int main(void) {
   asmodel_manager *m = NULL;
   asmodel_limits lim = {1, 100, 100};
@@ -53,6 +57,19 @@ int main(void) {
   asmodel_generate_params params = {0};
   char *text = NULL;
   fixture f = {0, 0};
+  asmodel_provider p = {0};
+  asmodel_token_count tc;
+  tc = asmodel_provider_measure_prompt(NULL, "", "");
+  CHECK(tc.quality == ASMODEL_TOKENS_UNKNOWN && tc.admission_tokens == -1);
+  tc = asmodel_provider_measure_prompt(&p, "日本語", "{\"é\":42}");
+  CHECK(tc.quality == ASMODEL_TOKENS_ESTIMATED && tc.admission_tokens > tc.tokens);
+  p.count_prompt_tokens = count_prompt;
+  p.token_quality = ASMODEL_TOKENS_EXACT;
+  tc = asmodel_provider_measure_prompt(&p, "x", "y");
+  CHECK(tc.quality == ASMODEL_TOKENS_ESTIMATED);
+  p.tokenizer_id = "test-byte-v1"; p.chat_template_id = "test-chat-v1";
+  tc = asmodel_provider_measure_prompt(&p, "x", "y");
+  CHECK(tc.quality == ASMODEL_TOKENS_EXACT && tc.admission_tokens == 7);
   CHECK(asmodel_manager_create(&lim, load, &f, &m) == ASMODEL_OK);
   CHECK(asmodel_manager_register(m, &a) == ASMODEL_OK);
   CHECK(asmodel_manager_register(m, &b) == ASMODEL_OK);

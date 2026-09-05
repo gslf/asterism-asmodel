@@ -15,8 +15,8 @@ the same implementation:
 | `remote_provider` | Constrained output | Per-call reasoning control | Reuse |
 |---|---|---|---|
 | `LLAMA_SERVER` | native GBNF / JSON Schema | guaranteed OFF; a GBNF micro-pass cannot emit reasoning | `cache_prompt` |
-| `LMSTUDIO` | Chat Completions JSON Schema | guaranteed OFF on the verified path | server-managed cache |
-| `VLLM` | JSON Schema or `structured_outputs.grammar` | guaranteed OFF on current protocol | server-managed cache |
+| `LMSTUDIO` | Chat Completions JSON Schema | requests OFF; check returned usage | server-managed cache |
+| `VLLM` | JSON Schema or `structured_outputs.grammar` | requests OFF; validate the deployed server | server-managed cache |
 | `GENERIC` / unresolved `AUTO` | text only | none guaranteed | none guaranteed |
 
 Generation policy is a per-request contract through
@@ -29,8 +29,8 @@ declared profile, applied controls, finish reason, reasoning tokens, and cached
 input tokens so callers can verify the contract.
 
 Remote Chat Completions use SSE whenever a progress callback is supplied.
-`stream_options.include_usage` preserves exact accounting across LM Studio,
-llama.cpp server, and vLLM; received chunks emit zero-length progress
+`stream_options.include_usage` requests usage from the server;
+`usage_known` indicates whether it was actually returned. Received chunks emit zero-length progress
 heartbeats without leaking reasoning text. `deadline_ms` is a per-request wall
 duration, not a fixed transport timeout: zero leaves inference unbounded and a
 positive expiry returns `ASMODEL_ERR_TIMEOUT`. Connection establishment keeps
@@ -46,3 +46,15 @@ ctest --test-dir build --output-on-failure
 ```
 
 See `include/asmodel.h` for the stable C API.
+
+## Accounting contract (ABI 3)
+
+`asmodel_provider_measure_prompt` distinguishes exact, estimated and unavailable
+counts. Exact status requires a successful template-aware callback and tokenizer
+and chat-template identities. Remote byte heuristics are estimates. Without a
+verified tokenizer the admission policy reserves at least UTF-8 bytes plus 256;
+this is conservative and uncalibrated, not an exact tokenizer or a universal
+upper bound. `result_info` binds diagnostics and usage to one generation while
+the provider is locked. A missing usage response must not be interpreted as zero.
+Queue/load time is deducted from the request duration before backend dispatch;
+manager lock acquisition is currently blocking.

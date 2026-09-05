@@ -9,7 +9,8 @@ extern "C" {
 #endif
 
 #define ASMODEL_VERSION_MAJOR 0
-#define ASMODEL_VERSION_MINOR 2
+#define ASMODEL_VERSION_MINOR 3
+#define ASMODEL_ABI_VERSION 3
 #define ASMODEL_VERSION_PATCH 0
 #define ASMODEL_ID_MAX 64
 
@@ -94,7 +95,23 @@ typedef struct {
   int output_tokens;
   int reasoning_tokens;
   int cached_input_tokens;
+  int usage_known; /* zero means unknown, not zero consumption */
+  char error[512]; /* per-request provider diagnostic */
 } asmodel_generation_info;
+
+typedef enum {
+  ASMODEL_TOKENS_UNKNOWN = 0,
+  ASMODEL_TOKENS_EXACT,
+  ASMODEL_TOKENS_ESTIMATED
+} asmodel_token_quality;
+
+typedef struct {
+  asmodel_token_quality quality;
+  int tokens;
+  int admission_tokens;
+  const char *tokenizer;
+  const char *chat_template;
+} asmodel_token_count;
 
 typedef struct asmodel_manager asmodel_manager;
 
@@ -128,6 +145,7 @@ typedef struct {
   asmodel_reasoning_mode reasoning;
   int reasoning_budget;
   int require_constraint;
+  asmodel_generation_info *result_info; /* optional per-request result */
 } asmodel_generate_params;
 
 /* On ASMODEL_ERR_LIMIT, generate still returns every decoded partial byte in
@@ -140,6 +158,9 @@ typedef void (*asmodel_token_fn)(const char *utf8, size_t len, void *userdata);
 
 typedef struct {
   void *userdata;
+  asmodel_token_quality token_quality;
+  const char *tokenizer_id;
+  const char *chat_template_id;
   int (*generate)(void *userdata, const char *system_prompt,
                   const char *user_prompt, const char *grammar,
                   const asmodel_generate_params *params,
@@ -183,6 +204,11 @@ typedef struct {
   uint64_t evictions;
 } asmodel_model_stats;
 
+/* Borrowed identity strings have the provider's lifetime. Admission remains
+ * estimated unless both tokenizer and chat template are identified. */
+asmodel_token_count asmodel_provider_measure_prompt(const asmodel_provider *provider,
+                                                     const char *system_prompt,
+                                                     const char *user_prompt);
 /* Built-in OpenAI-compatible provider. It uses /chat/completions and
  * /embeddings via WinHTTP on Windows or libcurl on other platforms. */
 int asmodel_openai_provider_create(const asmodel_spec *spec,
@@ -190,6 +216,7 @@ int asmodel_openai_provider_create(const asmodel_spec *spec,
                                    char *error, size_t error_size);
 
 const char *asmodel_version(void);
+unsigned asmodel_abi_version(void);
 const char *asmodel_err_name(asmodel_err error);
 
 asmodel_err asmodel_manager_create(const asmodel_limits *limits,

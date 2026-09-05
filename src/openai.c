@@ -1283,6 +1283,9 @@ static int oai_generate(void *ud, const char *sys, const char *user,
       reply = decoded;
     }
   }
+  u->last_generation.usage_known =
+      find_key(reply.p, use_responses ? "input_tokens" : "prompt_tokens") != NULL &&
+      find_key(reply.p, use_responses ? "output_tokens" : "completion_tokens") != NULL;
   u->last_generation.input_tokens = int_key(
       reply.p, use_responses ? "input_tokens" : "prompt_tokens");
   u->last_generation.output_tokens = int_key(
@@ -1470,6 +1473,7 @@ int asmodel_openai_provider_create(const asmodel_spec *spec,
   out->generate = spec->embedding ? NULL : oai_generate;
   out->embed = spec->embedding ? oai_embed : NULL;
   out->count_tokens = heuristic;
+  out->token_quality = ASMODEL_TOKENS_ESTIMATED;
   out->last_error = oai_last_error;
   out->capabilities = oai_capabilities;
   out->last_generation_info = oai_last_generation_info;

@@ -5,7 +5,7 @@ option(ASMODEL_BUILD_TESTS "Build asmodel tests" ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(CURL QUIET)
-add_library(asmodel_obj OBJECT src/asmodel.c src/openai.c)
+add_library(asmodel_obj OBJECT src/asmodel.c src/openai.c src/tokens.c)
 target_include_directories(asmodel_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(asmodel_obj PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 if(MSVC)
