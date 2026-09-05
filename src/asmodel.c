@@ -1,5 +1,6 @@
 #include "asmodel.h"
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,8 @@ static void mu_init(asm_mutex *m) { InitializeCriticalSection(m); }
 static void mu_drop(asm_mutex *m) { DeleteCriticalSection(m); }
 static void mu_lock(asm_mutex *m) { EnterCriticalSection(m); }
 static void mu_unlock(asm_mutex *m) { LeaveCriticalSection(m); }
+static int mu_try(asm_mutex *m) { return TryEnterCriticalSection(m) != 0; }
+static void pause_wait(void) { Sleep(2); }
 static int64_t mono_ms(void) { return (int64_t)GetTickCount64(); }
 #else
 #include <pthread.h>
@@ -24,12 +27,29 @@ static void mu_init(asm_mutex *m) { (void)pthread_mutex_init(m, NULL); }
 static void mu_drop(asm_mutex *m) { (void)pthread_mutex_destroy(m); }
 static void mu_lock(asm_mutex *m) { (void)pthread_mutex_lock(m); }
 static void mu_unlock(asm_mutex *m) { (void)pthread_mutex_unlock(m); }
+static int mu_try(asm_mutex *m) { return pthread_mutex_trylock(m) == 0; }
+static void pause_wait(void) {
+  struct timespec delay = {0, 2000000};
+  (void)nanosleep(&delay, NULL);
+}
 static int64_t mono_ms(void) {
   struct timespec ts;
   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 #endif
+
+/* Short bounded waits keep the C99 manager portable. Native loading itself
+ * is not interruptible; callers are checked again before inference dispatch. */
+static asmodel_err mu_wait(asm_mutex *mu, int64_t deadline, volatile int *cancel) {
+  if (!deadline && !cancel) { mu_lock(mu); return ASMODEL_OK; }
+  for (;;) {
+    if (cancel && *cancel) return ASMODEL_ERR_CANCELLED;
+    if (deadline && mono_ms() >= deadline) return ASMODEL_ERR_TIMEOUT;
+    if (mu_try(mu)) return ASMODEL_OK;
+    pause_wait();
+  }
+}
 
 typedef struct {
   asmodel_spec spec;
@@ -247,20 +267,30 @@ asmodel_err asmodel_manager_register(asmodel_manager *m,
   return ASMODEL_OK;
 }
 
-static asmodel_err begin_call(asmodel_manager *m, const char *id,
-                              model_slot **out) {
+static asmodel_err begin_request(asmodel_manager *m, const char *id,
+                                  int64_t deadline, volatile int *cancel,
+                                  model_slot **out) {
   model_slot *s;
-  asmodel_err e;
-  mu_lock(&m->mu);
+  asmodel_err e = mu_wait(&m->mu, deadline, cancel);
+  if (e != ASMODEL_OK) return e;
   s = find_slot(m, id);
   if (!s) { mu_unlock(&m->mu); return ASMODEL_ERR_NOT_FOUND; }
   e = ensure_loaded(m, s);
   if (e == ASMODEL_OK) s->in_use++;
   mu_unlock(&m->mu);
   if (e != ASMODEL_OK) return e;
-  mu_lock(&s->call_mu);
+  e = mu_wait(&s->call_mu, deadline, cancel);
+  if (e != ASMODEL_OK) {
+    mu_lock(&m->mu); s->in_use--; mu_unlock(&m->mu);
+    return e;
+  }
   *out = s;
   return ASMODEL_OK;
+}
+
+static asmodel_err begin_call(asmodel_manager *m, const char *id,
+                              model_slot **out) {
+  return begin_request(m, id, 0, NULL, out);
 }
 
 static void end_call(asmodel_manager *m, model_slot *s) {
@@ -327,13 +357,15 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
   char detail[384] = {0};
   asmodel_generate_params remaining;
   int64_t started = mono_ms();
-  if (!m || !id || !params || !out_text) return ASMODEL_ERR_INVALID;
+  if (!m || !id || !params || !out_text || params->deadline_ms < 0) return ASMODEL_ERR_INVALID;
   *out_text = NULL;
   if (out_in) *out_in = 0;
   if (out_gen) *out_gen = 0;
   if (params->result_info) memset(params->result_info, 0, sizeof *params->result_info);
   if (cancel && *cancel) return ASMODEL_ERR_CANCELLED;
-  e = begin_call(m, id, &s);
+  int64_t deadline = params->deadline_ms > 0 ?
+      (params->deadline_ms > INT64_MAX - started ? INT64_MAX : started + params->deadline_ms) : 0;
+  e = begin_request(m, id, deadline, cancel, &s);
   if (e != ASMODEL_OK) return e;
   remaining = *params;
   if (params->deadline_ms > 0) {

@@ -57,4 +57,6 @@ this is conservative and uncalibrated, not an exact tokenizer or a universal
 upper bound. `result_info` binds diagnostics and usage to one generation while
 the provider is locked. A missing usage response must not be interpreted as zero.
 Queue/load time is deducted from the request duration before backend dispatch;
-manager lock acquisition is currently blocking.
+generation queue waits observe cancellation and deadlines. Native model loading
+itself still runs under the manager lock and cannot yet be interrupted; a backend
+must cooperate to bound time spent inside its loader or inference callback.
