@@ -9,8 +9,8 @@ extern "C" {
 #endif
 
 #define ASMODEL_VERSION_MAJOR 0
-#define ASMODEL_VERSION_MINOR 5
-#define ASMODEL_ABI_VERSION 5
+#define ASMODEL_VERSION_MINOR 6
+#define ASMODEL_ABI_VERSION 6
 #define ASMODEL_VERSION_PATCH 0
 #define ASMODEL_ID_MAX 64
 
@@ -32,9 +32,9 @@ typedef enum {
   ASMODEL_BACKEND_OPENAI
 } asmodel_backend;
 
-/* OpenAI-shaped servers are different protocols in practice.  The remote
- * profile selects a verified adapter. AUTO is conservative and resolves to
- * GENERIC until a future discovery protocol supplies positive evidence. */
+/* Profiles select protocol adapters, not proof of server/model conformance.
+ * AUTO is conservative and resolves to GENERIC. Capabilities must be verified
+ * for the actual server, model and template before relying on their behavior. */
 typedef enum {
   ASMODEL_REMOTE_AUTO = 0,
   ASMODEL_REMOTE_GENERIC,
@@ -156,7 +156,7 @@ typedef struct {
   double temperature;
   double top_p;
   double repeat_penalty;
-  int max_tokens;
+  int max_tokens; /* required positive output budget */
   /* Maximum wall-clock duration for this inference request.  Zero leaves
    * the transport unbounded; the caller may still cancel through `cancel`. */
   int64_t deadline_ms;
@@ -167,7 +167,7 @@ typedef struct {
    * GBNF argument. Providers select a supported representation; they never
    * infer application semantics from grammar text. NULL means no JSON form. */
   const char *output_schema;
-  asmodel_generation_info *result_info; /* optional per-request result */
+  asmodel_generation_info *result_info; /* caller-owned; borrowed only during this request */
 } asmodel_generate_params;
 
 typedef struct {
@@ -182,9 +182,9 @@ typedef struct {
   asmodel_embedding_info *result_info;
 } asmodel_embed_params;
 
-/* On ASMODEL_ERR_LIMIT, generate still returns every decoded partial byte in
- * out_text and reports ASMODEL_FINISH_LENGTH.  The caller owns that text and
- * may continue from it; LIMIT is not a discarded/retried completion. */
+/* Failed/interrupted generation can return decoded partial bytes in out_text.
+ * The caller owns them; partial bytes never turn an error into successful output.
+ * LIMIT reports FINISH_LENGTH. Missing consumption remains explicitly unknown. */
 
 /* Output callback. A zero-length piece is a transport-progress heartbeat;
  * callers must not render it, but may use it to refresh stall detection. */
@@ -206,11 +206,7 @@ typedef struct {
   int (*count_tokens)(void *userdata, const char *text);
   int (*count_prompt_tokens)(void *userdata, const char *system_prompt,
                              const char *user_prompt);
-  /* Optional provider diagnostic for the most recent failed operation.
-   * The returned pointer remains owned by the provider. */
-  const char *(*last_error)(void *userdata);
   int (*capabilities)(void *userdata, asmodel_capabilities *out);
-  int (*last_generation_info)(void *userdata, asmodel_generation_info *out);
   void (*destroy)(void *userdata);
 } asmodel_provider;
 
@@ -290,12 +286,9 @@ int asmodel_count_prompt_tokens(asmodel_manager *manager, const char *id,
 asmodel_err asmodel_manager_capabilities(asmodel_manager *manager,
                                          const char *id,
                                          asmodel_capabilities *out);
-asmodel_err asmodel_manager_last_generation_info(
-    asmodel_manager *manager, const char *id, asmodel_generation_info *out);
 int asmodel_provider_capabilities(const asmodel_provider *provider,
                                   asmodel_capabilities *out);
-int asmodel_provider_last_generation_info(const asmodel_provider *provider,
-                                          asmodel_generation_info *out);
+
 int asmodel_remote_capabilities(asmodel_remote_provider provider,
                                 int context_tokens, int embedding,
                                 asmodel_capabilities *out);

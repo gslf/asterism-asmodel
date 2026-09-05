@@ -3,6 +3,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -21,21 +22,14 @@ class Handler(BaseHTTPRequestHandler):
             assert request["model"] == "lm-model"
             assert request["reasoning"] == {"effort": "none"}
             assert request["max_output_tokens"] == 64
-            assert request["tool_choice"] == "required"
             assert request["store"] is False
-            tool = request["tools"][0]
-            assert tool["name"] == "asmodel_emit"
-            assert tool["strict"] is True
+            assert request["instructions"] == "system"
+            assert request["input"] == "user"
+            assert "tools" not in request
             response = {
                 "status": "completed",
-                "output": [{
-                    "type": "function_call",
-                    "name": "asmodel_emit",
-                    "arguments": json.dumps({
-                        "class": "COMPLEX", "detail": "NORMAL",
-                        "mode": "PLAN", "task": "DEBUG",
-                    }),
-                }],
+                "output": [{"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "native response"}]}],
                 "usage": {
                     "input_tokens": 13,
                     "output_tokens": 7,
@@ -116,6 +110,18 @@ class Handler(BaseHTTPRequestHandler):
                                  "finish_reason": "length"}],
                     "usage": {"prompt_tokens": 11, "completion_tokens": 32},
                 }
+            elif request["model"] == "partial-timeout-model":
+                prefix = ('data: ' + json.dumps({"choices": [{"delta": {"content": "kept chunk"}}]})
+                          + '\n\ndata: {"choices":').encode()
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("content-length", str(len(prefix) + 1000))
+                self.end_headers()
+                self.wfile.write(prefix)
+                self.wfile.flush()
+                time.sleep(0.2)
+                self.close_connection = True
+                return
             elif request["model"] == "timeout-model":
                 time.sleep(0.2)
                 response = {
@@ -165,16 +171,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(body)
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             pass
 
 
-server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class CheckedServer(ThreadingHTTPServer):
+    errors = []
+
+    def handle_error(self, _request, _address):
+        self.errors.append(traceback.format_exc())
+
+
+server = CheckedServer(("127.0.0.1", 0), Handler)
 thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
 try:
     url = f"http://127.0.0.1:{server.server_port}/v1"
-    raise SystemExit(subprocess.call([sys.argv[1], url]))
+    result = subprocess.call([sys.argv[1], url])
 finally:
     server.shutdown()
     thread.join()
+assert not server.errors, "\n".join(server.errors)
+raise SystemExit(result)

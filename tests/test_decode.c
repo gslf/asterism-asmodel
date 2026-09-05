@@ -34,6 +34,7 @@ int main(void) {
   CHECK(!strcmp(text,"partial")); free(text);
   body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n";
   CHECK(asmodel_openai_decode(body,0,1,&info,&text,&reasoning) == ASMODEL_ERR_BACKEND);
+  CHECK(text && !strcmp(text,"partial") && !info.usage_known); free(text); text = NULL;
   body = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n"
          "data: {\"choices\":[{\"delta\":{\"content\":\"after finish\"}}]}\n"
          "data: [DONE]\n";

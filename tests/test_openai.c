@@ -14,6 +14,11 @@ static void capture_token(const char *text, size_t len, void *ud) {
   else output_callbacks++;
 }
 
+static void cancel_on_progress(const char *text, size_t len, void *ud) {
+  (void)text;
+  if (!len) *(volatile int *)ud = 1;
+}
+
 int main(int argc, char **argv) {
   asmodel_spec spec;
   asmodel_provider provider;
@@ -45,7 +50,7 @@ int main(int argc, char **argv) {
                                      sizeof error) != 0) {
     fprintf(stderr, "%s\n", error); return 3;
   }
-  memset(&params, 0, sizeof params);
+  memset(&params, 0, sizeof params); params.result_info = &info;
   params.temperature = 0.2; params.top_p = 0.9; params.max_tokens = 32;
   if (!provider.generate ||
       provider.generate(provider.userdata, "system", "user",
@@ -96,12 +101,31 @@ int main(int argc, char **argv) {
                                 NULL, &params, NULL, NULL, NULL, &text,
                                 &prompt_tokens, &generated_tokens) !=
           ASMODEL_ERR_TIMEOUT || text != NULL ||
-      !timeout_provider.last_error ||
-      strstr(timeout_provider.last_error(timeout_provider.userdata),
+      strstr(info.error,
              "inference deadline expired") == NULL)
     return 19;
   timeout_provider.destroy(timeout_provider.userdata);
-  memset(&params, 0, sizeof params);
+  spec.remote_model = "partial-timeout-model";
+  if (asmodel_openai_provider_create(&spec,&timeout_provider,error,sizeof error)) return 27;
+  params.deadline_ms = 50;
+  if (timeout_provider.generate(timeout_provider.userdata,"system","user",NULL,&params,
+      NULL,NULL,NULL,&text,&prompt_tokens,&generated_tokens) != ASMODEL_ERR_TIMEOUT ||
+      !text || strcmp(text,"kept chunk") || info.usage_known || info.finish_reason != ASMODEL_FINISH_ERROR)
+    return 28;
+  free(text); text = NULL;
+  volatile int cancelled = 1;
+  if (timeout_provider.generate(timeout_provider.userdata,"system","user",NULL,&params,
+      NULL,NULL,&cancelled,&text,&prompt_tokens,&generated_tokens) != ASMODEL_ERR_CANCELLED ||
+      text || !info.usage_known || info.input_tokens || info.output_tokens || info.finish_reason != ASMODEL_FINISH_CANCELLED)
+    return 29;
+  cancelled = 0; params.deadline_ms = 1000;
+  if (timeout_provider.generate(timeout_provider.userdata,"system","user",NULL,&params,
+      cancel_on_progress,(void *)&cancelled,&cancelled,&text,NULL,NULL) != ASMODEL_ERR_CANCELLED ||
+      !text || strcmp(text,"kept chunk") || info.usage_known || info.finish_reason != ASMODEL_FINISH_CANCELLED)
+    return 31;
+  free(text); text = NULL;
+  timeout_provider.destroy(timeout_provider.userdata);
+  memset(&params, 0, sizeof params); params.result_info = &info;
   params.temperature = 0.0; params.top_p = 1.0; params.max_tokens = 64;
   params.reasoning = ASMODEL_REASONING_REQUIRED_OFF;
   params.require_constraint = 1;
@@ -135,8 +159,7 @@ int main(int argc, char **argv) {
       output_callbacks != 1)
     return 10;
   free(text);
-  if (asmodel_provider_last_generation_info(&lmstudio, &info) != 0 ||
-      info.finish_reason != ASMODEL_FINISH_STOP || !info.json_output ||
+  if (info.finish_reason != ASMODEL_FINISH_STOP || !info.json_output ||
       !(info.applied & ASMODEL_APPLIED_REASONING_OFF) ||
       !(info.applied & ASMODEL_APPLIED_CONSTRAINT) ||
       info.reasoning_tokens != 0)
@@ -233,6 +256,16 @@ int main(int argc, char **argv) {
   const char *slow = "timeout";
   if (embedder.embed(embedder.userdata,&slow,1,1,&embedding_params,batch_vectors) != ASMODEL_ERR_TIMEOUT ||
       embedding_info.usage_known || embedding_info.completed) return 28;
+  asmodel_generation_info previous = info, separate = {0};
+  params.result_info = &separate;
+  params.max_tokens = 64; params.require_constraint = 0; params.output_schema = NULL;
+  params.reasoning = ASMODEL_REASONING_REQUIRED_OFF;
+  if (lmstudio.generate(lmstudio.userdata,"system","user",NULL,&params,NULL,NULL,NULL,
+      &text,NULL,NULL) != ASMODEL_OK || !text || strcmp(text,"native response") || separate.json_output || memcmp(&previous,&info,sizeof info))
+    return 30;
+  free(text); text = NULL;
+
+  params.result_info = &info;
   /* Admission accounts for schemas before spending any remote inference. */
   asmodel_provider bounded;
   spec.embedding = 0; spec.context_tokens = 300; spec.remote_model = "budget-model";
@@ -242,7 +275,7 @@ int main(int argc, char **argv) {
   text = NULL;
   if (bounded.generate(bounded.userdata, "", "", NULL, &params, NULL, NULL,
       NULL, &text, NULL, NULL) != ASMODEL_ERR_LIMIT || text) return 25;
-  if (asmodel_provider_last_generation_info(&bounded, &info) || !info.usage_known)
+  if (!info.usage_known || info.input_tokens || info.output_tokens || info.finish_reason != ASMODEL_FINISH_ERROR)
     return 26;
   bounded.destroy(bounded.userdata);
   provider.destroy(provider.userdata);

@@ -47,7 +47,7 @@ ctest --test-dir build --output-on-failure
 
 See `include/asmodel.h` for the stable C API.
 
-## Accounting contract (ABI 5)
+## Accounting contract (ABI 6)
 
 `asmodel_provider_measure_prompt` distinguishes exact, estimated and unavailable
 counts. Exact status requires a successful template-aware callback and tokenizer
@@ -115,3 +115,16 @@ durations apply to embedding calls too. Native callbacks cooperate through the
 ggml abort hook. Model loading and synchronous WinHTTP I/O remain cooperation
 limits; this is not a hard real-time guarantee. Conservative remote admission
 uses UTF-8 bytes plus overhead until a verified tokenizer is available.
+
+## Request ownership
+
+Generation requires a positive output budget. The manager always supplies a
+request-local receipt to the provider, even when its caller does not request one.
+There is no provider-global last-result accessor. Timeout, cancellation and
+backend errors can return validated partial text; callers must inspect the status
+before treating it as a completed answer. Missing or interrupted usage stays
+unknown. Transport progress callbacks may carry an empty fragment.
+
+Queue time and request preparation consume the same deadline as inference.
+Native synchronous loading and Windows HTTP cancellation remain backend limits.
+Protocol mock tests exercise contracts, not real-model capability conformance.

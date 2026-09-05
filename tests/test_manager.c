@@ -54,7 +54,7 @@ int main(void) {
                     .base_url = "http://localhost/v1", .remote_model = "b",
                     .context_tokens = 1024, .warm = 1};
   asmodel_model_stats stats[2];
-  asmodel_generate_params params = {0};
+  asmodel_generate_params params = {.max_tokens=8};
   char *text = NULL;
   fixture f = {0, 0};
   asmodel_provider p = {0};

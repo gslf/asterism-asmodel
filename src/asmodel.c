@@ -164,7 +164,11 @@ static asmodel_err ensure_loaded(asmodel_manager *m, model_slot *s) {
 }
 
 unsigned asmodel_abi_version(void) { return ASMODEL_ABI_VERSION; }
-const char *asmodel_version(void) { return "0.4.0"; }
+#define MODEL_STR_INNER(x) #x
+#define MODEL_STR(x) MODEL_STR_INNER(x)
+const char *asmodel_version(void) {
+  return MODEL_STR(ASMODEL_VERSION_MAJOR) "." MODEL_STR(ASMODEL_VERSION_MINOR) "." MODEL_STR(ASMODEL_VERSION_PATCH);
+}
 
 const char *asmodel_err_name(asmodel_err e) {
   switch (e) {
@@ -356,38 +360,53 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
   char detail[384] = {0};
   asmodel_generate_params remaining;
   int64_t started = mono_ms();
-  if (!m || !id || !params || !out_text || params->deadline_ms < 0) return ASMODEL_ERR_INVALID;
-  *out_text = NULL;
+  if (out_text) *out_text = NULL;
   if (out_in) *out_in = 0;
   if (out_gen) *out_gen = 0;
-  if (params->result_info) memset(params->result_info, 0, sizeof *params->result_info);
-  if (cancel && *cancel) return ASMODEL_ERR_CANCELLED;
+  asmodel_generation_info local = {0};
+  asmodel_generation_info *info = params && params->result_info ? params->result_info : &local;
+  memset(info,0,sizeof *info); info->usage_known = 1;
+  info->finish_reason = ASMODEL_FINISH_ERROR;
+  if (!m || !id || !params || !out_text || params->deadline_ms < 0 || params->max_tokens <= 0) {
+    snprintf(info->error,sizeof info->error,"invalid generation request");
+    return ASMODEL_ERR_INVALID;
+  }
+  if (cancel && *cancel) { info->finish_reason = ASMODEL_FINISH_CANCELLED; return ASMODEL_ERR_CANCELLED; }
   int64_t deadline = params->deadline_ms > 0 ?
       (params->deadline_ms > INT64_MAX - started ? INT64_MAX : started + params->deadline_ms) : 0;
   e = begin_request(m, id, deadline, cancel, &s);
-  if (e != ASMODEL_OK) return e;
-  remaining = *params;
+  if (e != ASMODEL_OK) {
+    info->finish_reason = e == ASMODEL_ERR_CANCELLED ? ASMODEL_FINISH_CANCELLED : ASMODEL_FINISH_ERROR;
+    snprintf(info->error,sizeof info->error,"request could not start: %s",asmodel_err_name(e));
+    return e;
+  }
+  remaining = *params; remaining.result_info = info;
   if (params->deadline_ms > 0) {
     remaining.deadline_ms -= mono_ms() - started;
-    if (remaining.deadline_ms <= 0) { end_call(m, s); return ASMODEL_ERR_TIMEOUT; }
+    if (remaining.deadline_ms <= 0) {
+      snprintf(info->error,sizeof info->error,"deadline expired before inference");
+      end_call(m, s); return ASMODEL_ERR_TIMEOUT;
+    }
   }
-  if (cancel && *cancel) { end_call(m, s); return ASMODEL_ERR_CANCELLED; }
+  if (cancel && *cancel) {
+    info->finish_reason = ASMODEL_FINISH_CANCELLED;
+    end_call(m, s); return ASMODEL_ERR_CANCELLED;
+  }
+  info->usage_known = 0; info->finish_reason = ASMODEL_FINISH_UNKNOWN;
+  /* Only this request can supply consumption. */
   rc = s->provider.generate ?
       s->provider.generate(s->provider.userdata, sys, user, grammar, &remaining,
                            token_fn, token_ud, cancel, out_text, out_in, out_gen)
       : -1;
-  if (params->result_info && s->provider.last_generation_info)
-    (void)s->provider.last_generation_info(s->provider.userdata, params->result_info);
-  if (rc != ASMODEL_OK && s->provider.last_error) {
-    const char *provider_error = s->provider.last_error(s->provider.userdata);
-    if (provider_error && provider_error[0])
-      snprintf(detail, sizeof detail, "%s", provider_error);
-  }
-  if (params->result_info && detail[0])
-    snprintf(params->result_info->error, sizeof params->result_info->error, "%s", detail);
+  if (rc != ASMODEL_OK && rc != ASMODEL_ERR_LIMIT)
+    info->finish_reason = rc == ASMODEL_ERR_CANCELLED ? ASMODEL_FINISH_CANCELLED : ASMODEL_FINISH_ERROR;
+  else if (info->finish_reason == ASMODEL_FINISH_UNKNOWN)
+    info->finish_reason = rc == ASMODEL_OK ? ASMODEL_FINISH_STOP : ASMODEL_FINISH_LENGTH;
+  if (remaining.result_info->error[0])
+    snprintf(detail,sizeof detail,"%.383s",remaining.result_info->error);
   end_call(m, s);
-  if (cancel && *cancel) return ASMODEL_ERR_CANCELLED;
-  if (deadline && mono_ms() >= deadline) return ASMODEL_ERR_TIMEOUT;
+  if (cancel && *cancel) { info->finish_reason = ASMODEL_FINISH_CANCELLED; return ASMODEL_ERR_CANCELLED; }
+  if (deadline && mono_ms() >= deadline) { info->finish_reason = ASMODEL_FINISH_ERROR; return ASMODEL_ERR_TIMEOUT; }
   if (rc == ASMODEL_OK) return ASMODEL_OK;
   if (rc >= ASMODEL_ERR_INVALID && rc <= ASMODEL_ERR_TIMEOUT)
     return seterr(m, (asmodel_err)rc, "generation failed for '%s'%s%s", id,
@@ -485,15 +504,6 @@ int asmodel_provider_capabilities(const asmodel_provider *provider,
              : -1;
 }
 
-int asmodel_provider_last_generation_info(const asmodel_provider *provider,
-                                          asmodel_generation_info *out) {
-  if (!provider || !out) return -1;
-  memset(out, 0, sizeof *out);
-  return provider->last_generation_info
-             ? provider->last_generation_info(provider->userdata, out)
-             : -1;
-}
-
 int asmodel_remote_capabilities(asmodel_remote_provider provider,
                                 int context_tokens, int embedding,
                                 asmodel_capabilities *out) {
@@ -554,20 +564,6 @@ asmodel_err asmodel_manager_capabilities(asmodel_manager *m, const char *id,
                           "model '%s' does not expose capabilities", id);
 }
 
-asmodel_err asmodel_manager_last_generation_info(
-    asmodel_manager *m, const char *id, asmodel_generation_info *out) {
-  model_slot *s;
-  asmodel_err e;
-  int rc;
-  if (!m || !id || !out) return ASMODEL_ERR_INVALID;
-  e = begin_call(m, id, &s);
-  if (e != ASMODEL_OK) return e;
-  rc = asmodel_provider_last_generation_info(&s->provider, out);
-  end_call(m, s);
-  return rc == 0 ? ASMODEL_OK
-                 : seterr(m, ASMODEL_ERR_UNSUPPORTED,
-                          "model '%s' does not expose generation metadata", id);
-}
 
 size_t asmodel_manager_stats(asmodel_manager *m, asmodel_model_stats *out,
                              size_t cap) {

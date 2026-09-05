@@ -29,7 +29,7 @@ static int loader(void *ud, const asmodel_spec *spec, asmodel_provider *out,
   return 0;
 }
 static void *first(void *ud) {
-  asmodel_generate_params p = {0};
+  asmodel_generate_params p = {.max_tokens=8};
   char *out = NULL;
   asmodel_err e = asmodel_generate(ud, "model", "", "", NULL, &p, NULL, NULL,
                                    NULL, &out, NULL, NULL);
@@ -40,7 +40,7 @@ int main(void) {
   asmodel_manager *m = NULL;
   asmodel_spec spec = {.id = "model", .embedding = 1, .embedding_dim = 2};
   asmodel_limits limits = {.max_resident = 1};
-  asmodel_generate_params p = {.deadline_ms = 20};
+  asmodel_generate_params p = {.max_tokens=8,.deadline_ms = 20};
   asmodel_model_stats stats;
   char *out = NULL;
   pthread_t worker;

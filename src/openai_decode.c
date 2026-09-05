@@ -116,7 +116,9 @@ int asmodel_openai_decode(const char *body, int responses, int sse,
     p = next;
   }
   if (bad || (sse && (!finished || info->finish_reason == ASMODEL_FINISH_UNKNOWN))) {
-    free(b.p); info->usage_known = 0; return ASMODEL_ERR_BACKEND;
+    if (sse && b.p && b.p[0]) *text = b.p; else free(b.p);
+    info->usage_known = 0; info->finish_reason = ASMODEL_FINISH_ERROR;
+    return ASMODEL_ERR_BACKEND;
   }
   if (!b.p && append(&b,"")) return ASMODEL_ERR_NOMEM;
   *text = b.p;
