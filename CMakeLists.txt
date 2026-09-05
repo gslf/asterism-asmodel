@@ -5,7 +5,7 @@ option(ASMODEL_BUILD_TESTS "Build asmodel tests" ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(CURL QUIET)
-add_library(asmodel_obj OBJECT src/asmodel.c src/openai.c src/openai_decode.c src/tokens.c src/pipeline.c
+add_library(asmodel_obj OBJECT src/asmodel.c src/input.c src/input_json.c src/tools.c src/tool_decode.c src/openai.c src/openai_decode.c src/tokens.c src/pipeline.c
   src/json_support.c src/json_value.c src/json_parse.c src/json_write.c)
 target_include_directories(asmodel_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(asmodel_obj PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
@@ -52,6 +52,14 @@ endif()
 
 if(ASMODEL_BUILD_TESTS)
   enable_testing()
+  add_executable(asmodel-tools-tests tests/test_tools.c)
+  target_include_directories(asmodel-tools-tests PRIVATE src)
+  target_link_libraries(asmodel-tools-tests PRIVATE asmodel_static)
+  add_test(NAME asmodel-tools COMMAND asmodel-tools-tests)
+  add_executable(asmodel-input-tests tests/test_input.c)
+  target_include_directories(asmodel-input-tests PRIVATE src)
+  target_link_libraries(asmodel-input-tests PRIVATE asmodel_static)
+  add_test(NAME asmodel-input COMMAND asmodel-input-tests)
   add_executable(asmodel-embedding-tests tests/test_embedding.c)
   target_link_libraries(asmodel-embedding-tests PRIVATE asmodel_static)
   add_test(NAME asmodel-embedding COMMAND asmodel-embedding-tests)
@@ -71,7 +79,7 @@ if(ASMODEL_BUILD_TESTS)
   if(WIN32 OR CURL_FOUND)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-      add_executable(asmodel-openai-smoke tests/test_openai.c)
+      add_executable(asmodel-openai-smoke tests/test_openai.c tests/test_messages_wire.c tests/test_tools_wire.c)
       target_link_libraries(asmodel-openai-smoke PRIVATE asmodel_static)
       add_test(NAME asmodel-openai
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_openai.py

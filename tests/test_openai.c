@@ -1,4 +1,5 @@
 #include "asmodel.h"
+#include "input_fixture.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,8 @@ static void cancel_on_progress(const char *text, size_t len, void *ud) {
   if (!len) *(volatile int *)ud = 1;
 }
 
+int test_tools_wire(const char *url);
+int test_messages_wire(const char *url);
 int main(int argc, char **argv) {
   asmodel_spec spec;
   asmodel_provider provider;
@@ -40,6 +43,8 @@ int main(int argc, char **argv) {
   int prompt_tokens = 0, generated_tokens = 0;
   float vector[3] = {0};
   if (argc != 2) return 2;
+  if (test_messages_wire(argv[1])) return 31;
+  if (test_tools_wire(argv[1])) return 32;
   memset(&spec, 0, sizeof spec);
   spec.id = "remote"; spec.backend = ASMODEL_BACKEND_OPENAI;
   spec.base_url = argv[1]; spec.remote_model = "test-model";
@@ -53,7 +58,7 @@ int main(int argc, char **argv) {
   memset(&params, 0, sizeof params); params.result_info = &info;
   params.temperature = 0.2; params.top_p = 0.9; params.max_tokens = 32;
   if (!provider.generate ||
-      provider.generate(provider.userdata, "system", "user",
+      provider.generate(provider.userdata, TEXT_INPUT("system","user"),
                         "root ::= \"ok\"", &params, capture_token, NULL, NULL,
                         &text, &prompt_tokens, &generated_tokens) != 0)
     return 4;
@@ -68,7 +73,7 @@ int main(int argc, char **argv) {
                                      sizeof error) != 0)
     return 6;
   text = NULL;
-  if (limited.generate(limited.userdata, "system", "user",
+  if (limited.generate(limited.userdata, TEXT_INPUT("system","user"),
                        "root ::= \"ok\"", &params, NULL, NULL, NULL,
                        &text, &prompt_tokens, &generated_tokens) !=
           ASMODEL_ERR_LIMIT ||
@@ -82,7 +87,7 @@ int main(int argc, char **argv) {
                                      sizeof error) != 0)
     return 20;
   text = NULL;
-  if (partial_limited.generate(partial_limited.userdata, "system", "user",
+  if (partial_limited.generate(partial_limited.userdata, TEXT_INPUT("system","user"),
                                NULL, &params, NULL, NULL, NULL,
                                &text, &prompt_tokens, &generated_tokens) !=
           ASMODEL_ERR_LIMIT ||
@@ -97,7 +102,7 @@ int main(int argc, char **argv) {
     return 18;
   params.deadline_ms = 20;
   text = NULL;
-  if (timeout_provider.generate(timeout_provider.userdata, "system", "user",
+  if (timeout_provider.generate(timeout_provider.userdata, TEXT_INPUT("system","user"),
                                 NULL, &params, NULL, NULL, NULL, &text,
                                 &prompt_tokens, &generated_tokens) !=
           ASMODEL_ERR_TIMEOUT || text != NULL ||
@@ -108,18 +113,18 @@ int main(int argc, char **argv) {
   spec.remote_model = "partial-timeout-model";
   if (asmodel_openai_provider_create(&spec,&timeout_provider,error,sizeof error)) return 27;
   params.deadline_ms = 50;
-  if (timeout_provider.generate(timeout_provider.userdata,"system","user",NULL,&params,
+  if (timeout_provider.generate(timeout_provider.userdata,TEXT_INPUT("system","user"),NULL,&params,
       NULL,NULL,NULL,&text,&prompt_tokens,&generated_tokens) != ASMODEL_ERR_TIMEOUT ||
       !text || strcmp(text,"kept chunk") || info.usage_known || info.finish_reason != ASMODEL_FINISH_ERROR)
     return 28;
   free(text); text = NULL;
   volatile int cancelled = 1;
-  if (timeout_provider.generate(timeout_provider.userdata,"system","user",NULL,&params,
+  if (timeout_provider.generate(timeout_provider.userdata,TEXT_INPUT("system","user"),NULL,&params,
       NULL,NULL,&cancelled,&text,&prompt_tokens,&generated_tokens) != ASMODEL_ERR_CANCELLED ||
       text || !info.usage_known || info.input_tokens || info.output_tokens || info.finish_reason != ASMODEL_FINISH_CANCELLED)
     return 29;
   cancelled = 0; params.deadline_ms = 1000;
-  if (timeout_provider.generate(timeout_provider.userdata,"system","user",NULL,&params,
+  if (timeout_provider.generate(timeout_provider.userdata,TEXT_INPUT("system","user"),NULL,&params,
       cancel_on_progress,(void *)&cancelled,&cancelled,&text,NULL,NULL) != ASMODEL_ERR_CANCELLED ||
       !text || strcmp(text,"kept chunk") || info.usage_known || info.finish_reason != ASMODEL_FINISH_CANCELLED)
     return 31;
@@ -144,12 +149,12 @@ int main(int argc, char **argv) {
     return 9;
   text = NULL;
   /* No schema is inferred even if an application-like grammar is supplied. */
-  if (lmstudio.generate(lmstudio.userdata, "system", "user", classify_grammar,
+  if (lmstudio.generate(lmstudio.userdata, TEXT_INPUT("system","user"), classify_grammar,
       &params, NULL, NULL, NULL, &text, NULL, NULL) != ASMODEL_ERR_UNSUPPORTED) return 23;
   params.output_schema = classify_schema;
   heartbeats = 0;
   output_callbacks = 0;
-  if (lmstudio.generate(lmstudio.userdata, "system", "user",
+  if (lmstudio.generate(lmstudio.userdata, TEXT_INPUT("system","user"),
                         classify_grammar, &params, capture_token, NULL, NULL,
                         &text, &prompt_tokens, &generated_tokens) !=
           ASMODEL_OK ||
@@ -168,7 +173,7 @@ int main(int argc, char **argv) {
   /* The adapter preserves the caller's JSON object without unwrapping it. */
   params.output_schema = curation_schema;
   text = NULL;
-  if (lmstudio.generate(lmstudio.userdata, "system", "user",
+  if (lmstudio.generate(lmstudio.userdata, TEXT_INPUT("system","user"),
                         classify_grammar, &params, NULL, NULL, NULL,
                         &text, &prompt_tokens, &generated_tokens) !=
           ASMODEL_OK || !text || strcmp(text, "{\"output\": \"NOOP\\n\"}") != 0)
@@ -185,7 +190,7 @@ int main(int argc, char **argv) {
   text = NULL;
   heartbeats = 0;
   output_callbacks = 0;
-  if (vllm.generate(vllm.userdata, "system", "user", classify_grammar,
+  if (vllm.generate(vllm.userdata, TEXT_INPUT("system","user"), classify_grammar,
                     &params, capture_token, NULL, NULL, &text, &prompt_tokens,
                     &generated_tokens) != ASMODEL_OK ||
       !text || strcmp(text,
@@ -203,7 +208,7 @@ int main(int argc, char **argv) {
   text = NULL;
   heartbeats = 0;
   output_callbacks = 0;
-  if (llama.generate(llama.userdata, "system", "user", "root ::= \"ok\"",
+  if (llama.generate(llama.userdata, TEXT_INPUT("system","user"), "root ::= \"ok\"",
                      &params, capture_token, NULL, NULL, &text, &prompt_tokens,
                      &generated_tokens) != ASMODEL_OK ||
       !text || strcmp(text, "ok") != 0 || heartbeats < 1 ||
@@ -219,7 +224,7 @@ int main(int argc, char **argv) {
                                      sizeof error) != 0)
     return 16;
   text = NULL;
-  if (generic.generate(generic.userdata, "system", "user",
+  if (generic.generate(generic.userdata, TEXT_INPUT("system","user"),
                        "root ::= \"ok\"", &params, NULL, NULL, NULL,
                        &text, &prompt_tokens, &generated_tokens) !=
           ASMODEL_ERR_UNSUPPORTED || text != NULL)
@@ -260,7 +265,7 @@ int main(int argc, char **argv) {
   params.result_info = &separate;
   params.max_tokens = 64; params.require_constraint = 0; params.output_schema = NULL;
   params.reasoning = ASMODEL_REASONING_REQUIRED_OFF;
-  if (lmstudio.generate(lmstudio.userdata,"system","user",NULL,&params,NULL,NULL,NULL,
+  if (lmstudio.generate(lmstudio.userdata,TEXT_INPUT("system","user"),NULL,&params,NULL,NULL,NULL,
       &text,NULL,NULL) != ASMODEL_OK || !text || strcmp(text,"native response") || separate.json_output || memcmp(&previous,&info,sizeof info))
     return 30;
   free(text); text = NULL;
@@ -273,7 +278,7 @@ int main(int argc, char **argv) {
   if (asmodel_openai_provider_create(&spec, &bounded, error, sizeof error)) return 24;
   params.max_tokens = 1; params.output_schema = classify_schema;
   text = NULL;
-  if (bounded.generate(bounded.userdata, "", "", NULL, &params, NULL, NULL,
+  if (bounded.generate(bounded.userdata, TEXT_INPUT("",""), NULL, &params, NULL, NULL,
       NULL, &text, NULL, NULL) != ASMODEL_ERR_LIMIT || text) return 25;
   if (!info.usage_known || info.input_tokens || info.output_tokens || info.finish_reason != ASMODEL_FINISH_ERROR)
     return 26;

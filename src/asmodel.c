@@ -1,4 +1,5 @@
 #include "asmodel.h"
+#include "tools.h"
 #include "pipeline.h"
 #include "runtime_clock.h"
 
@@ -348,8 +349,7 @@ size_t asmodel_manager_evict_idle(asmodel_manager *m, int64_t idle_ms) {
 }
 
 asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
-                             const char *sys, const char *user,
-                             const char *grammar,
+                             const asmodel_input *input, const char *grammar,
                              const asmodel_generate_params *params,
                              asmodel_token_fn token_fn, void *token_ud,
                              volatile int *cancel, char **out_text,
@@ -360,6 +360,7 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
   char detail[384] = {0};
   asmodel_generate_params remaining;
   int64_t started = mono_ms();
+  if (params && params->tools) asmodel_tool_calls_clear(params->tools->output);
   if (out_text) *out_text = NULL;
   if (out_in) *out_in = 0;
   if (out_gen) *out_gen = 0;
@@ -371,7 +372,12 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
     snprintf(info->error,sizeof info->error,"invalid generation request");
     return ASMODEL_ERR_INVALID;
   }
+  asmodel_err contract = asmodel_tools_validate(params->tools);
+  if (contract != ASMODEL_OK) return contract;
+  if (params->tools && (grammar || params->output_schema || params->require_constraint)) return ASMODEL_ERR_INVALID;
   if (cancel && *cancel) { info->finish_reason = ASMODEL_FINISH_CANCELLED; return ASMODEL_ERR_CANCELLED; }
+  asmodel_err valid = asmodel_input_validate(input);
+  if (valid != ASMODEL_OK) return valid;
   int64_t deadline = params->deadline_ms > 0 ?
       (params->deadline_ms > INT64_MAX - started ? INT64_MAX : started + params->deadline_ms) : 0;
   e = begin_request(m, id, deadline, cancel, &s);
@@ -395,9 +401,11 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
   info->usage_known = 0; info->finish_reason = ASMODEL_FINISH_UNKNOWN;
   /* Only this request can supply consumption. */
   rc = s->provider.generate ?
-      s->provider.generate(s->provider.userdata, sys, user, grammar, &remaining,
+      s->provider.generate(s->provider.userdata, input, grammar, &remaining,
                            token_fn, token_ud, cancel, out_text, out_in, out_gen)
       : -1;
+  if (rc == ASMODEL_OK) rc = asmodel_tools_accept(params->tools,info->finish_reason,input);
+  if (rc != ASMODEL_OK && params->tools) asmodel_tool_calls_clear(params->tools->output);
   if (rc != ASMODEL_OK && rc != ASMODEL_ERR_LIMIT)
     info->finish_reason = rc == ASMODEL_ERR_CANCELLED ? ASMODEL_FINISH_CANCELLED : ASMODEL_FINISH_ERROR;
   else if (info->finish_reason == ASMODEL_FINISH_UNKNOWN)
@@ -405,6 +413,8 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
   if (remaining.result_info->error[0])
     snprintf(detail,sizeof detail,"%.383s",remaining.result_info->error);
   end_call(m, s);
+  if ((cancel && *cancel) || (deadline && mono_ms() >= deadline))
+    if (params->tools) asmodel_tool_calls_clear(params->tools->output);
   if (cancel && *cancel) { info->finish_reason = ASMODEL_FINISH_CANCELLED; return ASMODEL_ERR_CANCELLED; }
   if (deadline && mono_ms() >= deadline) { info->finish_reason = ASMODEL_FINISH_ERROR; return ASMODEL_ERR_TIMEOUT; }
   if (rc == ASMODEL_OK) return ASMODEL_OK;
@@ -483,14 +493,14 @@ int asmodel_count_tokens(asmodel_manager *m, const char *id,
 }
 
 int asmodel_count_prompt_tokens(asmodel_manager *m, const char *id,
-                                const char *sys, const char *user) {
+                                const asmodel_input *input) {
   model_slot *s;
   asmodel_err e;
   int n;
-  if (!m || !id) return -1;
+  if (!m || !id || asmodel_input_validate(input) != ASMODEL_OK) return -1;
   e = begin_call(m, id, &s);
   if (e != ASMODEL_OK) return -1;
-  n = asmodel_provider_measure_prompt(&s->provider, sys, user).admission_tokens;
+  n = asmodel_provider_measure_prompt(&s->provider, input).admission_tokens;
   end_call(m, s);
   return n;
 }

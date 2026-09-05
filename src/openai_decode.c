@@ -1,5 +1,6 @@
 /* Parse protocol fields by structure. Content strings cannot impersonate usage. */
 #include "openai_decode.h"
+#include "tools.h"
 #include "asmodel_json.h"
 #include <float.h>
 #include <limits.h>
@@ -51,6 +52,7 @@ static int finish(const json *v, int responses, asmodel_generation_info *info) {
   const char *s = string(v);
   if (!s) return -1;
   if (!strcmp(s,responses ? "completed" : "stop")) info->finish_reason = ASMODEL_FINISH_STOP;
+  else if (!responses && !strcmp(s,"tool_calls")) info->finish_reason = ASMODEL_FINISH_TOOL_CALLS;
   else if (!strcmp(s,responses ? "incomplete" : "length")) info->finish_reason = ASMODEL_FINISH_LENGTH;
   else return -1;
   return 0;
@@ -59,7 +61,7 @@ static const json *choice(const json *root) {
   const json *a = get(root,"choices");
   return asmodel_json_array_len(a) == 1 ? asmodel_json_array_at(a,0) : NULL;
 }
-static int chat(const json *root, int delta, asmodel_generation_info *info, buffer *b) {
+static int chat(const json *root, int delta, asmodel_generation_info *info, asmodel_tool_calls *calls, buffer *b) {
   const json *c = choice(root);
   if (!c) return -1;
   int index;
@@ -69,15 +71,19 @@ static int chat(const json *root, int delta, asmodel_generation_info *info, buff
   if (role && (!string(role) || strcmp(string(role),"assistant"))) return -1;
   const json *content = get(message,"content");
   if (content && asmodel_json_typeof(content) != ASMODEL_JSON_NULL && append(b,string(content))) return -1;
-  if (!delta && !string(content)) return -1;
+  if (asmodel_tool_decode(get(message,"tool_calls"),delta,0,calls)) return -1;
+  if (!delta && !string(content) && !(calls && calls->count)) return -1;
   return finish(get(c,"finish_reason"),0,info);
 }
-static int response(const json *root, asmodel_generation_info *info, buffer *b) {
+static int response(const json *root, asmodel_generation_info *info, asmodel_tool_calls *calls, buffer *b) {
   const json *a = get(root,"output");
+  if (asmodel_tool_decode(a,0,1,calls)) return -1;
   for (size_t i = 0; i < asmodel_json_array_len(a); i++) {
     const json *item = asmodel_json_array_at(a,i);
     const char *type = string(get(item,"type"));
     if (!type || strcmp(type,"message")) continue;
+    const char *role = string(get(item,"role"));
+    if (!role || strcmp(role,"assistant")) return -1;
     const json *content = get(item,"content");
     for (size_t j = 0; j < asmodel_json_array_len(content); j++) {
       const json *part = asmodel_json_array_at(content,j);
@@ -85,20 +91,24 @@ static int response(const json *root, asmodel_generation_info *info, buffer *b) 
       if (type && !strcmp(type,"output_text") && append(b,string(get(part,"text")))) return -1;
     }
   }
-  return !b->p || finish(get(root,"status"),1,info) ? -1 : 0;
+  if ((!b->p && !(calls && calls->count)) || finish(get(root,"status"),1,info)) return -1;
+  if (info->finish_reason == ASMODEL_FINISH_STOP && calls && calls->count)
+    info->finish_reason = ASMODEL_FINISH_TOOL_CALLS;
+  return 0;
 }
 int asmodel_openai_decode(const char *body, int responses, int sse,
-    asmodel_generation_info *info, char **text, int *reasoning_known) {
+    asmodel_generation_info *info, asmodel_tool_calls *calls, char **text, int *reasoning_known) {
   buffer b = {0};
   json *root = NULL;
   int bad = !body, finished = 0;
   *text = NULL; *reasoning_known = 0;
+  asmodel_tool_calls_clear(calls);
   info->usage_known = 0; info->finish_reason = ASMODEL_FINISH_UNKNOWN;
   info->input_tokens = info->output_tokens = 0;
   info->reasoning_tokens = info->cached_input_tokens = 0;
   if (!sse && !bad) {
     bad = asmodel_json_parse(body,strlen(body),&root) || usage(root,responses,info,reasoning_known) ||
-        (responses ? response(root,info,&b) : chat(root,0,info,&b));
+        (responses ? response(root,info,calls,&b) : chat(root,0,info,calls,&b));
     asmodel_json_free(root); root = NULL;
   } else for (const char *p = body; !bad && p && *p; ) {
     size_t n = strcspn(p,"\n");
@@ -110,17 +120,19 @@ int asmodel_openai_decode(const char *body, int responses, int sse,
       if (n == 6 && !memcmp(p,"[DONE]",6)) { finished = 1; break; }
       bad = asmodel_json_parse(p,n,&root) || usage(root,0,info,reasoning_known);
       if (!bad && asmodel_json_array_len(get(root,"choices")))
-        bad = info->finish_reason != ASMODEL_FINISH_UNKNOWN || chat(root,1,info,&b);
+        bad = info->finish_reason != ASMODEL_FINISH_UNKNOWN || chat(root,1,info,calls,&b);
       asmodel_json_free(root); root = NULL;
     }
     p = next;
   }
-  if (bad || (sse && (!finished || info->finish_reason == ASMODEL_FINISH_UNKNOWN))) {
+  if (bad || info->finish_reason == ASMODEL_FINISH_UNKNOWN || (sse && !finished)) {
     if (sse && b.p && b.p[0]) *text = b.p; else free(b.p);
+    asmodel_tool_calls_clear(calls);
     info->usage_known = 0; info->finish_reason = ASMODEL_FINISH_ERROR;
     return ASMODEL_ERR_BACKEND;
   }
-  if (!b.p && append(&b,"")) return ASMODEL_ERR_NOMEM;
+  if (info->finish_reason == ASMODEL_FINISH_LENGTH) asmodel_tool_calls_clear(calls);
+  if (!b.p && append(&b,"")) { asmodel_tool_calls_clear(calls); return ASMODEL_ERR_NOMEM; }
   *text = b.p;
   return info->finish_reason == ASMODEL_FINISH_LENGTH ? ASMODEL_ERR_LIMIT : ASMODEL_OK;
 }

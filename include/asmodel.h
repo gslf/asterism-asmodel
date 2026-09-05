@@ -9,8 +9,8 @@ extern "C" {
 #endif
 
 #define ASMODEL_VERSION_MAJOR 0
-#define ASMODEL_VERSION_MINOR 6
-#define ASMODEL_ABI_VERSION 6
+#define ASMODEL_VERSION_MINOR 7
+#define ASMODEL_ABI_VERSION 7
 #define ASMODEL_VERSION_PATCH 0
 #define ASMODEL_ID_MAX 64
 
@@ -85,7 +85,8 @@ typedef enum {
   ASMODEL_FINISH_STOP,
   ASMODEL_FINISH_LENGTH,
   ASMODEL_FINISH_CANCELLED,
-  ASMODEL_FINISH_ERROR
+  ASMODEL_FINISH_ERROR,
+  ASMODEL_FINISH_TOOL_CALLS
 } asmodel_finish_reason;
 
 typedef struct {
@@ -152,6 +153,65 @@ typedef struct {
 asmodel_err asmodel_manager_embedding_key(asmodel_manager *manager, const char *id,
                                           char **out_key);
 
+/* Borrowed immutable input, valid through the synchronous call. Text blocks are
+ * concatenated within one role, never across roles. Tool payloads are data.
+ * Limits: 256 messages, 64 blocks/message, 256 calls, 8 MiB total UTF-8 bytes. */
+typedef enum {
+  ASMODEL_ROLE_SYSTEM = 0, ASMODEL_ROLE_DEVELOPER, ASMODEL_ROLE_USER,
+  ASMODEL_ROLE_ASSISTANT, ASMODEL_ROLE_TOOL
+} asmodel_role;
+typedef enum {
+  ASMODEL_BLOCK_TEXT = 0, ASMODEL_BLOCK_TOOL_CALL, ASMODEL_BLOCK_TOOL_RESULT
+} asmodel_block_kind;
+typedef struct {
+  asmodel_block_kind kind;
+  const char *text; /* text, JSON object arguments, or tool output */
+  const char *id;   /* required only for tool calls/results */
+  const char *name; /* required only for tool calls */
+} asmodel_block;
+typedef struct {
+  asmodel_role role;
+  const asmodel_block *blocks;
+  size_t count;
+} asmodel_message;
+typedef struct {
+  const asmodel_message *messages;
+  size_t count;
+} asmodel_input;
+/* Storage for application prompts that deliberately use two text messages. */
+typedef struct {
+  asmodel_input input;
+  asmodel_message messages[2];
+  asmodel_block blocks[2];
+} asmodel_text_input;
+void asmodel_input_pair(asmodel_text_input *out, const char *system, const char *user);
+const char *asmodel_role_name(asmodel_role role);
+asmodel_err asmodel_input_validate(const asmodel_input *input);
+/* malloc-owned text; tool blocks return UNSUPPORTED instead of being flattened. */
+asmodel_err asmodel_message_text(const asmodel_message *message, char **out);
+
+typedef struct {
+  const char *name;
+  const char *description;
+  const char *parameters; /* JSON Schema with object root; host validates execution arguments */
+} asmodel_tool_schema;
+typedef struct { char *id, *name, *arguments; } asmodel_tool_call;
+typedef struct {
+  asmodel_tool_call calls[32];
+  size_t count;
+} asmodel_tool_calls;
+/* Initialize to zero before first use. A new request clears previous calls.
+ * Only ASMODEL_OK + FINISH_TOOL_CALLS yields complete calls; errors clear them.
+ * This is a proposal, never authorization to execute a tool. */
+void asmodel_tool_calls_clear(asmodel_tool_calls *calls);
+typedef enum { ASMODEL_TOOLS_AUTO = 0, ASMODEL_TOOLS_REQUIRED, ASMODEL_TOOLS_NONE } asmodel_tool_choice;
+typedef struct {
+  const asmodel_tool_schema *schemas; /* 1..64 distinct names */
+  size_t count;
+  asmodel_tool_choice choice;
+  asmodel_tool_calls *output; /* required, caller-owned */
+} asmodel_tools;
+
 typedef struct {
   double temperature;
   double top_p;
@@ -167,6 +227,7 @@ typedef struct {
    * GBNF argument. Providers select a supported representation; they never
    * infer application semantics from grammar text. NULL means no JSON form. */
   const char *output_schema;
+  const asmodel_tools *tools; /* native tool contract; mutually exclusive with grammar/output_schema */
   asmodel_generation_info *result_info; /* caller-owned; borrowed only during this request */
 } asmodel_generate_params;
 
@@ -195,8 +256,7 @@ typedef struct {
   asmodel_token_quality token_quality;
   const char *tokenizer_id;
   const char *chat_template_id;
-  int (*generate)(void *userdata, const char *system_prompt,
-                  const char *user_prompt, const char *grammar,
+  int (*generate)(void *userdata, const asmodel_input *input, const char *grammar,
                   const asmodel_generate_params *params,
                   asmodel_token_fn token_fn, void *token_userdata,
                   volatile int *cancel, char **out_text,
@@ -204,8 +264,7 @@ typedef struct {
   int (*embed)(void *userdata, const char *const *texts, size_t count,
                int is_query, const asmodel_embed_params *params, float *out_vectors);
   int (*count_tokens)(void *userdata, const char *text);
-  int (*count_prompt_tokens)(void *userdata, const char *system_prompt,
-                             const char *user_prompt);
+  int (*count_prompt_tokens)(void *userdata, const asmodel_input *input);
   int (*capabilities)(void *userdata, asmodel_capabilities *out);
   void (*destroy)(void *userdata);
 } asmodel_provider;
@@ -237,8 +296,7 @@ typedef struct {
 /* Borrowed identity strings have the provider's lifetime. Admission remains
  * estimated unless both tokenizer and chat template are identified. */
 asmodel_token_count asmodel_provider_measure_prompt(const asmodel_provider *provider,
-                                                     const char *system_prompt,
-                                                     const char *user_prompt);
+                                                     const asmodel_input *input);
 /* Built-in OpenAI-compatible provider. It uses /chat/completions and
  * /embeddings via WinHTTP on Windows or libcurl on other platforms. */
 int asmodel_openai_provider_create(const asmodel_spec *spec,
@@ -263,8 +321,7 @@ size_t asmodel_manager_evict_idle(asmodel_manager *manager,
                                   int64_t idle_for_ms);
 
 asmodel_err asmodel_generate(asmodel_manager *manager, const char *id,
-                             const char *system_prompt,
-                             const char *user_prompt, const char *grammar,
+                             const asmodel_input *input, const char *grammar,
                              const asmodel_generate_params *params,
                              asmodel_token_fn token_fn, void *token_userdata,
                              volatile int *cancel, char **out_text,
@@ -281,8 +338,7 @@ asmodel_err asmodel_embed(asmodel_manager *manager, const char *id,
 int asmodel_count_tokens(asmodel_manager *manager, const char *id,
                          const char *text);
 int asmodel_count_prompt_tokens(asmodel_manager *manager, const char *id,
-                                const char *system_prompt,
-                                const char *user_prompt);
+                                const asmodel_input *input);
 asmodel_err asmodel_manager_capabilities(asmodel_manager *manager,
                                          const char *id,
                                          asmodel_capabilities *out);

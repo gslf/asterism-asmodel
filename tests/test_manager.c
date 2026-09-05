@@ -1,4 +1,5 @@
 #include "asmodel.h"
+#include "input_fixture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,14 +13,13 @@ static void drop(void *ud) {
   free(m);
 }
 static int count(void *ud, const char *s) { (void)ud; return (int)strlen(s); }
-static int timeout_generate(void *ud, const char *system_prompt,
-                            const char *user_prompt, const char *grammar,
+static int timeout_generate(void *ud, const asmodel_input *input, const char *grammar,
                             const asmodel_generate_params *params,
                             asmodel_token_fn token_fn, void *token_userdata,
                             volatile int *cancel, char **out_text,
                             int *out_prompt_tokens,
                             int *out_generated_tokens) {
-  (void)ud; (void)system_prompt; (void)user_prompt; (void)grammar;
+  (void)ud; (void)input; (void)grammar;
   (void)params; (void)token_fn; (void)token_userdata; (void)cancel;
   (void)out_prompt_tokens; (void)out_generated_tokens;
   *out_text = NULL;
@@ -40,8 +40,8 @@ static int load(void *ud, const asmodel_spec *spec, asmodel_provider *out,
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s:%d: %s\n", __FILE__, __LINE__, #x); return 1; } } while (0)
 
-static int count_prompt(void *ud, const char *sys, const char *user) {
-  (void)ud; (void)sys; (void)user; return 7;
+static int count_prompt(void *ud, const asmodel_input *input) {
+  (void)ud; (void)input; return 7;
 }
 
 int main(void) {
@@ -59,23 +59,32 @@ int main(void) {
   fixture f = {0, 0};
   asmodel_provider p = {0};
   asmodel_token_count tc;
-  tc = asmodel_provider_measure_prompt(NULL, "", "");
+  tc = asmodel_provider_measure_prompt(NULL, TEXT_INPUT("",""));
   CHECK(tc.quality == ASMODEL_TOKENS_UNKNOWN && tc.admission_tokens == -1);
-  tc = asmodel_provider_measure_prompt(&p, "日本語", "{\"é\":42}");
+  tc = asmodel_provider_measure_prompt(&p, TEXT_INPUT("日本語","{\"é\":42}"));
   CHECK(tc.quality == ASMODEL_TOKENS_ESTIMATED && tc.admission_tokens > tc.tokens);
   p.count_prompt_tokens = count_prompt;
   p.token_quality = ASMODEL_TOKENS_EXACT;
-  tc = asmodel_provider_measure_prompt(&p, "x", "y");
+  tc = asmodel_provider_measure_prompt(&p, TEXT_INPUT("x","y"));
   CHECK(tc.quality == ASMODEL_TOKENS_ESTIMATED);
   p.tokenizer_id = "test-byte-v1"; p.chat_template_id = "test-chat-v1";
-  tc = asmodel_provider_measure_prompt(&p, "x", "y");
+  tc = asmodel_provider_measure_prompt(&p, TEXT_INPUT("x","y"));
   CHECK(tc.quality == ASMODEL_TOKENS_EXACT && tc.admission_tokens == 7);
   CHECK(asmodel_manager_create(&lim, load, &f, &m) == ASMODEL_OK);
   CHECK(asmodel_manager_register(m, &a) == ASMODEL_OK);
   CHECK(asmodel_manager_register(m, &b) == ASMODEL_OK);
+  asmodel_generation_info info = {.input_tokens=99}; params.result_info = &info;
+  asmodel_input invalid = {0};
+  CHECK(asmodel_generate(m,"b",&invalid,NULL,&params,NULL,NULL,NULL,&text,NULL,NULL) == ASMODEL_ERR_INVALID);
+  CHECK(f.loads == 0 && info.usage_known && !info.input_tokens);
+  asmodel_tool_calls calls = {0};
+  asmodel_tool_schema tool = {"bad.name","description","{\"type\":\"object\"}"};
+  asmodel_tools tools = {&tool,1,ASMODEL_TOOLS_AUTO,&calls}; params.tools = &tools;
+  CHECK(asmodel_generate(m,"b",TEXT_INPUT("s","u"),NULL,&params,NULL,NULL,NULL,&text,NULL,NULL) == ASMODEL_ERR_INVALID);
+  CHECK(f.loads == 0 && info.usage_known && !calls.count); params.tools = NULL;
   CHECK(asmodel_count_tokens(m, "a", "hello") == 5);
   CHECK(asmodel_count_tokens(m, "b", "bye") == 3);
-  CHECK(asmodel_generate(m, "b", "system", "user", NULL, &params,
+  CHECK(asmodel_generate(m, "b", TEXT_INPUT("system","user"), NULL, &params,
                          NULL, NULL, NULL, &text, NULL, NULL) ==
         ASMODEL_ERR_TIMEOUT);
   CHECK(text == NULL);

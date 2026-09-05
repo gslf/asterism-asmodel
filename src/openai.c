@@ -1,5 +1,7 @@
 #include "asmodel.h"
 #include "openai_decode.h"
+#include "input_json.h"
+#include "tools.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -389,15 +391,27 @@ static int append_reasoning_responses(bytes *body, oai_provider *u,
          json_string(body, effort) || putsb(body, "}");
 }
 
+static int append_tools(bytes *body, const asmodel_tools *tools, int responses) {
+  if (!tools) return 0;
+  char *encoded = NULL;
+  if (asmodel_tools_json(tools,responses,&encoded) != ASMODEL_OK) return -1;
+  int bad = putsb(body,",\"tools\":") || putsb(body,encoded) || putsb(body,",\"tool_choice\":") ||
+      json_string(body,tools->choice == ASMODEL_TOOLS_REQUIRED ? "required" :
+          tools->choice == ASMODEL_TOOLS_NONE ? "none" : "auto");
+  free(encoded); return bad;
+}
+
 static int build_lmstudio_responses(bytes *body, oai_provider *u,
-                                    const char *sys, const char *user,
+                                    const asmodel_input *input,
                                     const asmodel_generate_params *params,
                                     asmodel_reasoning_mode reasoning, asmodel_generation_info *info) {
   char n[160];
-  if (putsb(body, "{\"model\":") || json_string(body, u->model) ||
-      putsb(body, ",\"instructions\":") || json_string(body, sys ? sys : "") ||
-      putsb(body, ",\"input\":") || json_string(body, user ? user : ""))
-    return -1;
+  char *encoded = NULL;
+  if (asmodel_input_json(input,1,&encoded) != ASMODEL_OK) return -1;
+  int failed = putsb(body, "{\"model\":") || json_string(body, u->model) ||
+      putsb(body, ",\"input\":") || putsb(body, encoded);
+  free(encoded);
+  if (failed) return -1;
   snprintf(n, sizeof n,
            ",\"temperature\":%.8g,\"top_p\":%.8g,\"max_output_tokens\":%d",
            params->temperature, params->top_p > 0 ? params->top_p : 1.0,
@@ -406,27 +420,25 @@ static int build_lmstudio_responses(bytes *body, oai_provider *u,
       append_reasoning_responses(body, u, reasoning,
                                  params->reasoning_budget, info))
     return -1;
-  if (putsb(body, ",\"store\":false")) return -1;
+  if (append_tools(body,params->tools,1) || putsb(body, ",\"store\":false")) return -1;
   return putsb(body, "}");
 }
 
 /* Until a verified tokenizer is available, count every UTF-8 byte plus a
  * template reserve. Include schemas that may be injected by the server. */
-static int request_fits(int context, int output, const char *sys,
-                        const char *user, const char *schema) {
-  if (context <= 0) return 1;
-  if (output < 0 || output > context || context-output < 256) return 0;
-  size_t left = (size_t)(context-output-256);
-  const char *parts[] = {sys, user, schema};
-  for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
-    size_t n = parts[i] ? strlen(parts[i]) : 0;
-    if (n > left) return 0;
-    left -= n;
-  }
-  return 1;
+static int request_fits(oai_provider *u, int output, const asmodel_input *input,
+                        const char *schema, const asmodel_tools *tools) {
+  asmodel_provider counter = {0};
+  asmodel_token_count count = asmodel_provider_measure_prompt(&counter,input);
+  if (count.admission_tokens < 0) return 0;
+  if (u->caps.context_tokens <= 0) return 1;
+  size_t need = (size_t)count.admission_tokens + (size_t)output + (schema ? strlen(schema) : 0);
+  if (tools) for (size_t i = 0; i < tools->count; i++)
+    need += strlen(tools->schemas[i].name)+strlen(tools->schemas[i].description)+strlen(tools->schemas[i].parameters)+128;
+  return need <= (size_t)u->caps.context_tokens;
 }
 
-static int oai_generate(void *ud, const char *sys, const char *user,
+static int oai_generate(void *ud, const asmodel_input *input,
                         const char *grammar,
                         const asmodel_generate_params *params,
                         asmodel_token_fn token_fn, void *token_ud,
@@ -437,6 +449,9 @@ static int oai_generate(void *ud, const char *sys, const char *user,
   bytes body = {0}, reply = {0};
   char num[128], error[256] = {0};
   const char *schema = params->output_schema;
+  char *encoded = NULL;
+  asmodel_tool_calls *calls = params->tools ? params->tools->output : NULL;
+  asmodel_tool_calls_clear(calls);
   asmodel_reasoning_mode reasoning;
   int use_responses = 0;
   int stream_chat = 0;
@@ -453,9 +468,15 @@ static int oai_generate(void *ud, const char *sys, const char *user,
   info->usage_known = 1; /* No request has been dispatched yet. */
   if (params->max_tokens <= 0 || params->deadline_ms < 0) { rc = ASMODEL_ERR_INVALID; goto done; }
   if (cancel && *cancel) { rc = ASMODEL_ERR_CANCELLED; goto done; }
+  rc = asmodel_tools_validate(params->tools);
+  if (rc != ASMODEL_OK) goto done;
+  if (params->tools && (grammar || schema || params->require_constraint)) { rc = ASMODEL_ERR_INVALID; goto done; }
+  rc = asmodel_input_validate(input);
+  if (rc != ASMODEL_OK) goto done;
+  rc = ASMODEL_ERR_BACKEND;
   const char *counted_schema = schema && (u->caps.flags & ASMODEL_CAP_JSON_SCHEMA) &&
       !(grammar && u->remote_provider == ASMODEL_REMOTE_LLAMA_SERVER) ? schema : NULL;
-  if (!request_fits(u->caps.context_tokens, params->max_tokens, sys, user, counted_schema)) {
+  if (!request_fits(u, params->max_tokens, input, counted_schema, params->tools)) {
     snprintf(info->error, sizeof info->error,
              "estimated request including output schema exceeds context budget");
     rc = ASMODEL_ERR_LIMIT;
@@ -476,7 +497,7 @@ static int oai_generate(void *ud, const char *sys, const char *user,
   use_responses = u->remote_provider == ASMODEL_REMOTE_LMSTUDIO &&
                   reasoning != ASMODEL_REASONING_DEFAULT && grammar == NULL && schema == NULL;
   if (use_responses) {
-    if (build_lmstudio_responses(&body, u, sys, user, params, reasoning, info)) {
+    if (build_lmstudio_responses(&body, u, input, params, reasoning, info)) {
       snprintf(info->error, sizeof info->error,
                "LM Studio profile cannot apply the requested controls");
       rc = ASMODEL_ERR_UNSUPPORTED;
@@ -491,11 +512,9 @@ static int oai_generate(void *ud, const char *sys, const char *user,
      * when the caller did not request progress. */
     stream_chat = token_fn != NULL ||
                   u->remote_provider != ASMODEL_REMOTE_GENERIC;
-    if (putsb(&body, "{\"model\":" ) || json_string(&body, u->model) ||
-        putsb(&body, ",\"messages\":[{\"role\":\"system\",\"content\":") ||
-        json_string(&body, sys ? sys : "") ||
-        putsb(&body, "},{\"role\":\"user\",\"content\":") ||
-        json_string(&body, user ? user : "") || putsb(&body, "}]")) goto done;
+    if (asmodel_input_json(input,0,&encoded) != ASMODEL_OK ||
+        putsb(&body, "{\"model\":") || json_string(&body,u->model) ||
+        putsb(&body,",\"messages\":") || putsb(&body,encoded)) goto done;
     snprintf(num, sizeof num,
              ",\"temperature\":%.8g,\"top_p\":%.8g,\"max_tokens\":%d",
              params->temperature, params->top_p > 0 ? params->top_p : 1.0,
@@ -524,6 +543,7 @@ static int oai_generate(void *ud, const char *sys, const char *user,
       }
       info->applied |= ASMODEL_APPLIED_CONSTRAINT;
     }
+    if (append_tools(&body,params->tools,0)) goto done;
     if (stream_chat &&
         putsb(&body,
               ",\"stream\":true,\"stream_options\":{\"include_usage\":true}"))
@@ -543,7 +563,7 @@ static int oai_generate(void *ud, const char *sys, const char *user,
                error[0] ? error : "OpenAI-compatible HTTP request failed");
       if (stream_chat && reply.p) {
         int reasoning_known = 0;
-        (void)asmodel_openai_decode(reply.p,0,1,info,out_text,&reasoning_known);
+        (void)asmodel_openai_decode(reply.p,0,1,info,calls,out_text,&reasoning_known);
       }
       if (http_rc == -2) rc = ASMODEL_ERR_TIMEOUT;
       goto done;
@@ -554,7 +574,7 @@ static int oai_generate(void *ud, const char *sys, const char *user,
   int reasoning_known = 0;
   rc = asmodel_openai_decode(reply.p,use_responses,
       stream_chat && (!response_start || *response_start != '{'),
-      info,out_text,&reasoning_known);
+      info,calls,out_text,&reasoning_known);
   if (out_in) *out_in = info->input_tokens;
   if (out_gen) *out_gen = info->output_tokens;
   if (rc != ASMODEL_OK && rc != ASMODEL_ERR_LIMIT) goto done;
@@ -575,11 +595,17 @@ static int oai_generate(void *ud, const char *sys, const char *user,
     rc = ASMODEL_ERR_UNSUPPORTED;
     goto done;
   }
+  if (rc == ASMODEL_OK) {
+    rc = asmodel_tools_accept(params->tools,info->finish_reason,input);
+    if (rc != ASMODEL_OK) snprintf(info->error,sizeof info->error,"provider violated the native tool contract");
+  }
   if (rc == ASMODEL_ERR_LIMIT)
     snprintf(info->error,sizeof info->error,"completion reached its output limit");
 
 done:
+  free(encoded);
   if (cancel && *cancel) rc = ASMODEL_ERR_CANCELLED;
+  if (rc != ASMODEL_OK) asmodel_tool_calls_clear(calls);
   if (rc != 0 && rc != ASMODEL_ERR_LIMIT) {
     if (!info->error[0])
       snprintf(info->error, sizeof info->error,

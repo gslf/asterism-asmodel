@@ -45,9 +45,9 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-See `include/asmodel.h` for the stable C API.
+See `include/asmodel.h` for the versioned C API.
 
-## Accounting contract (ABI 6)
+## Accounting contract (ABI 7)
 
 `asmodel_provider_measure_prompt` distinguishes exact, estimated and unavailable
 counts. Exact status requires a successful template-aware callback and tokenizer
@@ -72,8 +72,8 @@ The provider never examines grammar productions to identify an action, judge,
 classifier or memory operation, and never unwraps or rewrites application JSON.
 `result_info.json_output` identifies the selected representation. Applications
 must validate and interpret the returned value, including complete-but-invalid
-provider responses. This is the output-contract part of the planned IR; role/block
-messages, attachments and native tool-call history are not implemented yet.
+provider responses. Role/block messages and native tool contracts are described
+in [the input contract](docs/input.md). Attachments are not implemented yet.
 
 Remote admission includes the selected schema in its conservative byte estimate.
 Requests rejected before HTTP dispatch report known zero consumption. Declared

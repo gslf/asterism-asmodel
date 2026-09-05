@@ -1,6 +1,7 @@
 /* A queued deadline must expire while another request still owns the model. */
 #define _POSIX_C_SOURCE 200809L
 #include "asmodel.h"
+#include "input_fixture.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,10 +11,10 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wake = PTHREAD_COND_INITIALIZER;
 static int entered, release_request;
 
-static int generate(void *ud, const char *sys, const char *user, const char *grammar,
+static int generate(void *ud, const asmodel_input *input, const char *grammar,
                     const asmodel_generate_params *params, asmodel_token_fn fn,
                     void *fn_ud, volatile int *cancel, char **out, int *ti, int *to) {
-  (void)ud; (void)sys; (void)user; (void)grammar; (void)params;
+  (void)ud; (void)input; (void)grammar; (void)params;
   (void)fn; (void)fn_ud; (void)cancel; (void)out; (void)ti; (void)to;
   pthread_mutex_lock(&lock);
   entered++;
@@ -31,7 +32,7 @@ static int loader(void *ud, const asmodel_spec *spec, asmodel_provider *out,
 static void *first(void *ud) {
   asmodel_generate_params p = {.max_tokens=8};
   char *out = NULL;
-  asmodel_err e = asmodel_generate(ud, "model", "", "", NULL, &p, NULL, NULL,
+  asmodel_err e = asmodel_generate(ud, "model", TEXT_INPUT("",""), NULL, &p, NULL, NULL,
                                    NULL, &out, NULL, NULL);
   free(out);
   return e == ASMODEL_OK ? NULL : (void *)1;
@@ -50,7 +51,7 @@ int main(void) {
   pthread_mutex_lock(&lock);
   while (!entered) pthread_cond_wait(&wake, &lock);
   pthread_mutex_unlock(&lock);
-  asmodel_err e = asmodel_generate(m, "model", "", "", NULL, &p, NULL, NULL,
+  asmodel_err e = asmodel_generate(m, "model", TEXT_INPUT("",""), NULL, &p, NULL, NULL,
                                    NULL, &out, NULL, NULL);
   const char *input = "query";
   float vector[2];

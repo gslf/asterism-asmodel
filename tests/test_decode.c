@@ -12,7 +12,7 @@ int main(void) {
   int reasoning = 0, tokens = 0, known = 0;
   const char *body = "{\"choices\":[{\"message\":{\"content\":\"metadata inside content stays text\"},"
       "\"finish_reason\":\"stop\"}],\"metadata\":{\"prompt_tokens\":999,\"completion_tokens\":99}}";
-  CHECK(asmodel_openai_decode(body,0,0,&info,&text,&reasoning) == ASMODEL_OK);
+  CHECK(asmodel_openai_decode(body,0,0,&info,NULL,&text,&reasoning) == ASMODEL_OK);
   CHECK(!info.usage_known && !info.input_tokens && !info.output_tokens);
   CHECK(!strcmp(text,"metadata inside content stays text")); free(text);
   const char *bad[] = {
@@ -25,20 +25,20 @@ int main(void) {
     "{\"choices\":[{\"message\":{\"content\":\"ok\"},\"index\":1}]}"
   };
   for (size_t i = 0; i < sizeof bad/sizeof bad[0]; i++) {
-    CHECK(asmodel_openai_decode(bad[i],0,0,&info,&text,&reasoning) == ASMODEL_ERR_BACKEND);
+    CHECK(asmodel_openai_decode(bad[i],0,0,&info,NULL,&text,&reasoning) == ASMODEL_ERR_BACKEND);
     CHECK(text == NULL && !info.usage_known);
   }
   body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n"
          "data: [DONE]\n";
-  CHECK(asmodel_openai_decode(body,0,1,&info,&text,&reasoning) == ASMODEL_ERR_LIMIT);
+  CHECK(asmodel_openai_decode(body,0,1,&info,NULL,&text,&reasoning) == ASMODEL_ERR_LIMIT);
   CHECK(!strcmp(text,"partial")); free(text);
   body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n";
-  CHECK(asmodel_openai_decode(body,0,1,&info,&text,&reasoning) == ASMODEL_ERR_BACKEND);
+  CHECK(asmodel_openai_decode(body,0,1,&info,NULL,&text,&reasoning) == ASMODEL_ERR_BACKEND);
   CHECK(text && !strcmp(text,"partial") && !info.usage_known); free(text); text = NULL;
   body = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n"
          "data: {\"choices\":[{\"delta\":{\"content\":\"after finish\"}}]}\n"
          "data: [DONE]\n";
-  CHECK(asmodel_openai_decode(body,0,1,&info,&text,&reasoning) == ASMODEL_ERR_BACKEND);
+  CHECK(asmodel_openai_decode(body,0,1,&info,NULL,&text,&reasoning) == ASMODEL_ERR_BACKEND);
   float vectors[4] = {0};
   body = "{\"data\":[{\"index\":1,\"embedding\":[3,4]},{\"index\":0,\"embedding\":[1,0]}],"
          "\"usage\":{\"prompt_tokens\":7}}";
