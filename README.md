@@ -45,6 +45,10 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+The standalone Linux CI runs GCC and Clang with ASan/UBSan. It explicitly builds
+`asmodel-openai-smoke` so missing Python/libcurl cannot silently remove the HTTP
+contract suite. These are scripted provider checks, not real-model evaluation.
+
 See `include/asmodel.h` for the versioned C API.
 
 ## Accounting contract (ABI 7)
