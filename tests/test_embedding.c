@@ -4,11 +4,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-typedef struct { int calls, query, mode; size_t count; char first[128]; } fixture;
+typedef struct { int calls, query, mode; size_t count; char first[128], request_id[129]; } fixture;
 static int embed(void *ud, const char *const *texts, size_t count, int query,
                  const asmodel_embed_params *p, float *out) {
   fixture *f = ud;
   snprintf(f->first,sizeof f->first,"%s",texts[0]);
+  snprintf(f->request_id,sizeof f->request_id,"%s",p->request_id ? p->request_id : "");
   f->calls++; f->query = query; f->count = count;
   memset(p->result_info,0,sizeof *p->result_info);
   for (size_t i = 0; i < count; i++) {
@@ -45,16 +46,22 @@ int main(void) {
   strcpy(spec.pipeline.query_prefix,"changed: ");
   CHECK(asmodel_embed(m,"embed",texts,2,0,&params,vectors,3) == ASMODEL_ERR_INVALID);
   CHECK(!f.calls && info.usage_known && !info.completed);
+  params.request_id = "invalid request";
+  CHECK(asmodel_embed(m,"embed",texts,2,0,&params,vectors,4) == ASMODEL_ERR_INVALID);
+  CHECK(!f.calls && info.usage_known && !info.completed);
+  params.request_id = "document-batch/1";
   CHECK(asmodel_embed(m,"embed",texts,2,0,&params,vectors,4) == ASMODEL_OK);
   CHECK(f.calls == 1 && !f.query && f.count == 2 && info.completed == 2 && info.usage_known && info.input_tokens == 7);
   CHECK(!strcmp(f.first,"passage: query α"));
+  CHECK(!strcmp(f.request_id,"document-batch/1"));
   CHECK(fabs(vectors[0]-.6) < .00001 && fabs(vectors[3]-.8) < .00001);
   volatile int cancel = 1; params.cancel = &cancel;
   CHECK(asmodel_embed(m,"embed",texts,2,1,&params,vectors,4) == ASMODEL_ERR_CANCELLED);
   CHECK(f.calls == 1 && info.usage_known && !info.completed);
-  params.cancel = NULL; f.mode = 2;
+  params.cancel = NULL; f.mode = 2; params.request_id = "query-batch/2";
   CHECK(asmodel_embed(m,"embed",texts,2,1,&params,vectors,4) == ASMODEL_ERR_CANCELLED);
   CHECK(!strcmp(f.first,"query: query α"));
+  CHECK(!strcmp(f.request_id,"query-batch/2"));
   CHECK(f.query && info.completed == 1 && !info.usage_known && fabs(vectors[0]-.6) < .00001);
   f.mode = 1;
   CHECK(asmodel_embed(m,"embed",texts,2,1,&params,vectors,4) == ASMODEL_ERR_BACKEND);

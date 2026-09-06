@@ -51,7 +51,7 @@ contract suite. These are scripted provider checks, not real-model evaluation.
 
 See `include/asmodel.h` for the versioned C API.
 
-## Accounting contract (ABI 7)
+## Accounting contract (ABI 8)
 
 `asmodel_provider_measure_prompt` distinguishes exact, estimated and unavailable
 counts. Exact status requires a successful template-aware callback and tokenizer
@@ -64,6 +64,14 @@ Queue/load time is deducted from the request duration before backend dispatch;
 generation queue waits observe cancellation and deadlines. Native model loading
 itself still runs under the manager lock and cannot yet be interrupted; a backend
 must cooperate to bound time spent inside its loader or inference callback.
+
+Generation and embedding parameters optionally carry a borrowed `request_id`
+(1–128 printable ASCII bytes, excluding spaces). The manager validates it before
+loading or queueing and passes it unchanged to a host-supplied provider, including
+failed calls. Built-in HTTP adapters do not serialize it. This lets an embedding
+host correlate local traces and accounting without a shared "last request" slot.
+It does not deduplicate calls, authorize execution or provide an idempotency key.
+Hosts must choose identities meaningful within their own trace namespace.
 
 
 ## Explicit output contracts

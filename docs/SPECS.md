@@ -37,7 +37,7 @@ The runtime is responsible for:
 - registering model definitions and their provider-specific loaders;
 - loading, warming, retaining and evicting model instances;
 - enforcing resident-model, RAM and VRAM budgets;
-- exposing generation, embedding and exact token-count operations;
+- exposing generation, embedding and token counts with explicit measurement quality;
 - preserving reusable provider contexts and prompt/KV caches;
 - applying structured-output and reasoning controls;
 - reporting why generation stopped and how many tokens it consumed;

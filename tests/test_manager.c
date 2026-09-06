@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { int loads, destroys; } fixture;
+typedef struct { int loads, destroys; char request_id[ASMODEL_REQUEST_ID_MAX+1]; } fixture;
 typedef struct { fixture *f; } fake_model;
 
 static void drop(void *ud) {
@@ -19,8 +19,10 @@ static int timeout_generate(void *ud, const asmodel_input *input, const char *gr
                             volatile int *cancel, char **out_text,
                             int *out_prompt_tokens,
                             int *out_generated_tokens) {
-  (void)ud; (void)input; (void)grammar;
-  (void)params; (void)token_fn; (void)token_userdata; (void)cancel;
+  fake_model *m = ud;
+  snprintf(m->f->request_id,sizeof m->f->request_id,"%s",params->request_id ? params->request_id : "");
+  (void)input; (void)grammar;
+  (void)token_fn; (void)token_userdata; (void)cancel;
   (void)out_prompt_tokens; (void)out_generated_tokens;
   *out_text = NULL;
   return ASMODEL_ERR_TIMEOUT;
@@ -56,7 +58,7 @@ int main(void) {
   asmodel_model_stats stats[2];
   asmodel_generate_params params = {.max_tokens=8};
   char *text = NULL;
-  fixture f = {0, 0};
+  fixture f = {0};
   asmodel_provider p = {0};
   asmodel_token_count tc;
   tc = asmodel_provider_measure_prompt(NULL, TEXT_INPUT("",""));
@@ -82,12 +84,22 @@ int main(void) {
   asmodel_tools tools = {&tool,1,ASMODEL_TOOLS_AUTO,&calls}; params.tools = &tools;
   CHECK(asmodel_generate(m,"b",TEXT_INPUT("s","u"),NULL,&params,NULL,NULL,NULL,&text,NULL,NULL) == ASMODEL_ERR_INVALID);
   CHECK(f.loads == 0 && info.usage_known && !calls.count); params.tools = NULL;
+  char long_id[ASMODEL_REQUEST_ID_MAX+2];
+  memset(long_id,'x',sizeof long_id-1); long_id[sizeof long_id-1] = 0;
+  const char *bad_ids[] = {"", "has space", "line\nbreak", "\x7f", "é", long_id};
+  for (size_t i = 0; i < sizeof bad_ids/sizeof bad_ids[0]; i++) {
+    params.request_id = bad_ids[i];
+    CHECK(asmodel_generate(m,"b",TEXT_INPUT("s","u"),NULL,&params,NULL,NULL,NULL,&text,NULL,NULL) == ASMODEL_ERR_INVALID);
+    CHECK(f.loads == 0 && info.usage_known && !info.input_tokens);
+  }
+  long_id[ASMODEL_REQUEST_ID_MAX] = 0; params.request_id = long_id;
   CHECK(asmodel_count_tokens(m, "a", "hello") == 5);
   CHECK(asmodel_count_tokens(m, "b", "bye") == 3);
   CHECK(asmodel_generate(m, "b", TEXT_INPUT("system","user"), NULL, &params,
                          NULL, NULL, NULL, &text, NULL, NULL) ==
         ASMODEL_ERR_TIMEOUT);
   CHECK(text == NULL);
+  CHECK(!strcmp(f.request_id,long_id));
   CHECK(f.loads == 2 && f.destroys == 1);
   CHECK(asmodel_manager_stats(m, stats, 2) == 2);
   CHECK(!stats[0].resident && stats[0].evictions == 1);

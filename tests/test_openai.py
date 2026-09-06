@@ -13,6 +13,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("content-length", "0")))
+        assert b'host-only-correlation' not in raw
         request = json.loads(raw)
         if self.path == "/v1/chat/completions":
             # LM Studio, llama.cpp server, and vLLM profiles stream even when

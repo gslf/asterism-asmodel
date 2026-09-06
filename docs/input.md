@@ -1,4 +1,4 @@
-# Messages and native tool contracts (ABI 7)
+# Messages and native tool contracts (ABI 8)
 
 Generation and prompt counting accept `asmodel_input`, a borrowed immutable
 sequence of roles and content blocks. System/developer instructions precede the

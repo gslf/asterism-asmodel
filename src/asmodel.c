@@ -348,6 +348,16 @@ size_t asmodel_manager_evict_idle(asmodel_manager *m, int64_t idle_ms) {
   return n;
 }
 
+static int request_id_valid(const char *id) {
+  if (!id) return 1;
+  for (size_t i = 0; i <= ASMODEL_REQUEST_ID_MAX; i++) {
+    unsigned char ch = (unsigned char)id[i];
+    if (!ch) return i != 0;
+    if (i == ASMODEL_REQUEST_ID_MAX || ch < 33 || ch > 126) return 0;
+  }
+  return 0;
+}
+
 asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
                              const asmodel_input *input, const char *grammar,
                              const asmodel_generate_params *params,
@@ -368,7 +378,8 @@ asmodel_err asmodel_generate(asmodel_manager *m, const char *id,
   asmodel_generation_info *info = params && params->result_info ? params->result_info : &local;
   memset(info,0,sizeof *info); info->usage_known = 1;
   info->finish_reason = ASMODEL_FINISH_ERROR;
-  if (!m || !id || !params || !out_text || params->deadline_ms < 0 || params->max_tokens <= 0) {
+  if (!m || !id || !params || !out_text || params->deadline_ms < 0 || params->max_tokens <= 0 ||
+      !request_id_valid(params->request_id)) {
     snprintf(info->error,sizeof info->error,"invalid generation request");
     return ASMODEL_ERR_INVALID;
   }
@@ -435,7 +446,7 @@ asmodel_err asmodel_embed(asmodel_manager *m, const char *id,
   asmodel_embedding_info *result = request.result_info ? request.result_info : &info;
   memset(result,0,sizeof *result); result->usage_known = 1;
   if (!m || !id || !texts || !out || !count || count > 256 || request.deadline_ms < 0 ||
-      capacity > SIZE_MAX/sizeof(float))
+      capacity > SIZE_MAX/sizeof(float) || !request_id_valid(request.request_id))
     return ASMODEL_ERR_INVALID;
   for (size_t i = 0; i < count; i++) if (!texts[i]) return ASMODEL_ERR_INVALID;
   int64_t started = mono_ms();

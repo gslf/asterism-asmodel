@@ -5,18 +5,21 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wake = PTHREAD_COND_INITIALIZER;
 static int entered, release_request;
+static char observed[2][129];
 
 static int generate(void *ud, const asmodel_input *input, const char *grammar,
                     const asmodel_generate_params *params, asmodel_token_fn fn,
                     void *fn_ud, volatile int *cancel, char **out, int *ti, int *to) {
-  (void)ud; (void)input; (void)grammar; (void)params;
+  (void)ud; (void)input; (void)grammar;
   (void)fn; (void)fn_ud; (void)cancel; (void)out; (void)ti; (void)to;
   pthread_mutex_lock(&lock);
+  if (entered < 2) snprintf(observed[entered],sizeof observed[entered],"%s",params->request_id);
   entered++;
   pthread_cond_broadcast(&wake);
   while (!release_request) pthread_cond_wait(&wake, &lock);
@@ -30,7 +33,7 @@ static int loader(void *ud, const asmodel_spec *spec, asmodel_provider *out,
   return 0;
 }
 static void *first(void *ud) {
-  asmodel_generate_params p = {.max_tokens=8};
+  asmodel_generate_params p = {.max_tokens=8,.request_id="first"};
   char *out = NULL;
   asmodel_err e = asmodel_generate(ud, "model", TEXT_INPUT("",""), NULL, &p, NULL, NULL,
                                    NULL, &out, NULL, NULL);
@@ -41,7 +44,7 @@ int main(void) {
   asmodel_manager *m = NULL;
   asmodel_spec spec = {.id = "model", .embedding = 1, .embedding_dim = 2};
   asmodel_limits limits = {.max_resident = 1};
-  asmodel_generate_params p = {.max_tokens=8,.deadline_ms = 20};
+  asmodel_generate_params p = {.max_tokens=8,.deadline_ms = 20,.request_id="expired"};
   asmodel_model_stats stats;
   char *out = NULL;
   pthread_t worker;
@@ -65,10 +68,13 @@ int main(void) {
   pthread_cond_broadcast(&wake);
   pthread_mutex_unlock(&lock);
   pthread_join(worker, &result);
+  p.request_id = "after-queue"; p.deadline_ms = 0;
+  asmodel_err next = asmodel_generate(m,"model",TEXT_INPUT("",""),NULL,&p,NULL,NULL,NULL,&out,NULL,NULL);
   asmodel_manager_destroy(m);
   free(out);
   if (e != ASMODEL_ERR_TIMEOUT || embedding != ASMODEL_ERR_TIMEOUT ||
-      !info.usage_known || info.completed || calls != 1 || result || stats.in_use != 1) {
+      !info.usage_known || info.completed || calls != 1 || result || stats.in_use != 1 ||
+      next != ASMODEL_OK || strcmp(observed[0],"first") || strcmp(observed[1],"after-queue")) {
     fprintf(stderr, "queued request did not expire without dispatch: %d, calls=%d\n", e, calls);
     return 1;
   }

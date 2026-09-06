@@ -9,10 +9,11 @@ extern "C" {
 #endif
 
 #define ASMODEL_VERSION_MAJOR 0
-#define ASMODEL_VERSION_MINOR 7
-#define ASMODEL_ABI_VERSION 7
+#define ASMODEL_VERSION_MINOR 8
+#define ASMODEL_ABI_VERSION 8
 #define ASMODEL_VERSION_PATCH 0
 #define ASMODEL_ID_MAX 64
+#define ASMODEL_REQUEST_ID_MAX 128
 
 typedef enum {
   ASMODEL_OK = 0,
@@ -229,6 +230,10 @@ typedef struct {
   const char *output_schema;
   const asmodel_tools *tools; /* native tool contract; mutually exclusive with grammar/output_schema */
   asmodel_generation_info *result_info; /* caller-owned; borrowed only during this request */
+  /* Optional host correlation: 1..128 printable ASCII bytes without spaces.
+   * Borrowed for this call, passed intact to the loader's provider, never sent
+   * by the built-in HTTP adapter. It is not a cache or idempotency key. */
+  const char *request_id;
 } asmodel_generate_params;
 
 typedef struct {
@@ -241,6 +246,7 @@ typedef struct {
   int64_t deadline_ms; /* total duration, including manager waits; zero unbounded */
   volatile int *cancel;
   asmodel_embedding_info *result_info;
+  const char *request_id; /* same host-only correlation contract as generation */
 } asmodel_embed_params;
 
 /* Failed/interrupted generation can return decoded partial bytes in out_text.

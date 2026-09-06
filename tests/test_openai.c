@@ -56,6 +56,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "%s\n", error); return 3;
   }
   memset(&params, 0, sizeof params); params.result_info = &info;
+  params.request_id = "host-only-correlation";
   params.temperature = 0.2; params.top_p = 0.9; params.max_tokens = 32;
   if (!provider.generate ||
       provider.generate(provider.userdata, TEXT_INPUT("system","user"),
@@ -239,7 +240,8 @@ int main(int argc, char **argv) {
     return 6;
   const char *embedding_text = "embed me";
   asmodel_embedding_info embedding_info = {0};
-  asmodel_embed_params embedding_params = {.result_info = &embedding_info};
+  asmodel_embed_params embedding_params = {.result_info = &embedding_info,
+                                           .request_id = "host-only-correlation"};
   if (!embedder.embed ||
       embedder.embed(embedder.userdata,&embedding_text,1,1,&embedding_params,vector) != 0 ||
       embedding_info.completed != 1)
