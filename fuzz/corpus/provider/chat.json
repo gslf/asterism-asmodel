@@ -1,0 +1,1 @@
+{"choices":[{"index":0,"message":{"role":"assistant","content":"answer","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read","arguments":"{\"path\":\"code.c\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":4}}

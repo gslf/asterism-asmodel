@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "core_revision": "2d0e3db80da12d5a52a335dec02e25c68d15b06b",
+  "compiler": "clang version 22.1.8",
+  "asan_options": "detect_leaks=0",
+  "requested_seconds": 30,
+  "max_input_bytes": 16384,
+  "seed": 1,
+  "runs": {
+    "json": {
+      "exit_code": 0,
+      "executions": 2049489,
+      "elapsed_seconds": 31,
+      "peak_rss_mb": 326,
+      "findings": 0,
+      "log_path": "/tmp/asterism-fuzz-final-l6ch1egh/json.log",
+      "log_sha256": "8072d9203db5d9a271034da1012db7ef402e7cf2dc9d8a558894db534c6c04ff",
+      "executable_sha256": "5ecba9f18040958ec978ea4bbca68db85b20055e452c92a352c13292696d988f"
+    },
+    "provider": {
+      "exit_code": 0,
+      "executions": 305386,
+      "elapsed_seconds": 31,
+      "peak_rss_mb": 282,
+      "findings": 0,
+      "log_path": "/tmp/asterism-fuzz-final-l6ch1egh/provider.log",
+      "log_sha256": "314f321adb82370a9d8842047c30fff0987542f76b01169250d3f013d4c1ed99",
+      "executable_sha256": "6c301bcb4664fa3792e659cc7682175c49b0f471008828291647eabb9f6e5048"
+    }
+  }
+}

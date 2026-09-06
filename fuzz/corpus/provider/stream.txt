@@ -1,0 +1,6 @@
+data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"answer"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4}}
+
+data: [DONE]
+
