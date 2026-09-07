@@ -37,30 +37,34 @@ jobs:
           path: artifacts/
           if-no-files-found: ignore
   contracts:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: gcc, cc: gcc, flags: '' }
-          - { name: clang-sanitizers, cc: clang, flags: '-fsanitize=address,undefined -fno-omit-frame-pointer' }
+          - { name: linux-gcc, os: ubuntu-latest, cc: gcc, flags: '' }
+          - { name: linux-clang, os: ubuntu-latest, cc: clang, flags: '' }
+          - { name: macos-clang, os: macos-latest, cc: clang, flags: '' }
+          - { name: windows-msvc, os: windows-latest, cc: cl, flags: '' }
+          - { name: clang-sanitizers, os: ubuntu-latest, cc: clang, flags: '-fsanitize=address,undefined -fno-omit-frame-pointer' }
     name: ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       - name: Install HTTP test dependency
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
           CFLAGS: ${{ matrix.flags }}
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DASMODEL_BUILD_TESTS=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DASMODEL_BUILD_TESTS=ON
       - name: Require the HTTP conformance target
         # Missing CURL/Python must not silently remove the provider tests.
-        run: cmake --build build --target asmodel-openai-smoke -j 4
+        run: cmake --build build --config Release --target asmodel-openai-smoke -j 4
       - name: Build
-        run: cmake --build build -j 4
+        run: cmake --build build --config Release -j 4
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure

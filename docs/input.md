@@ -41,10 +41,10 @@ whether a proposal passes validation.
 
 A schema is an output request, not an execution grant. The host must validate
 arguments against its actual tool schema and current permissions before invoking
-anything. asmodel checks object structure and the declared tool set; it does not
+anything. ⁂ asmodel checks object structure and the declared tool set; it does not
 implement a universal JSON Schema validator or execute tools.
 
-Asngn/Asper adapters forward the full input and contract. Their existing micro
+⁂ asngn / ⁂ asper adapters forward the full input and contract. Their existing micro
 phases deliberately construct two text messages; engine use of a native decision
 path is a separate milestone. No new routing policy is inferred from provider
 names or passing fake-model tests.

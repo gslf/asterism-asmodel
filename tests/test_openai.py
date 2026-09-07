@@ -235,4 +235,6 @@ finally:
     server.shutdown()
     thread.join()
 assert not server.errors, "\n".join(server.errors)
+if result:
+    print(f"HTTP conformance executable failed with exit code {result}", file=sys.stderr)
 raise SystemExit(result)

@@ -1,36 +1,41 @@
-# asmodel — Architecture and Design
+# ⁂ asmodel — Architecture and Design
 
 ## 1. Why this project exists
 
-Asterism uses several models for different jobs: routing, planning, generation,
+⁂ asterism uses several models for different jobs: routing, planning, generation,
 memory curation and embeddings. Loading and controlling those models separately
 inside every component would duplicate weights, waste RAM and VRAM, fragment KV
 caches and make provider behavior inconsistent.
 
-`asmodel` is the process-wide model runtime that removes that duplication. It
-gives every Asterism component one contract for generation, embeddings,
+⁂ asmodel is the process-wide model runtime that removes that duplication. It
+gives every ⁂ asterism component one contract for generation, embeddings,
 tokenization and model residency, whether inference runs in-process or behind a
-local HTTP server.
+local or hosted HTTP service through a supported adapter.
 
 Its central idea is simple:
 
 > Model execution is shared infrastructure. Provider differences must end at
 > the runtime boundary, not leak into the agent, memory or tool layers.
 
-## 2. Place in Asterism
+The runtime is SLM-friendly and local-first, without a model-size or provider
+lock-in. Any LLM/provider can be integrated through a suitable adapter, while
+role-specific capabilities must still be checked. See the central
+[architecture decisions and system value](https://github.com/gslf/asterism-asngn/blob/main/docs/ARCHITECTURE.md).
+
+## 2. Place in ⁂ asterism
 
 The four projects divide responsibilities as follows:
 
-- **asmodel** owns model instances, provider protocols and inference resources.
-- **Asper** owns durable memory and bounded context materialization.
-- **astools** owns tool contracts, validation, permissions and execution.
-- **asngn** orchestrates turns and combines the other three components.
+- **⁂ asmodel** owns model instances, provider protocols and inference resources.
+- **⁂ asper** owns durable memory and bounded context materialization.
+- **⁂ astools** owns tool contracts, validation, permissions and execution.
+- **⁂ asngn** orchestrates turns and combines the other three components.
 
-Both asngn and embedded Asper can borrow the same `asmodel_manager`. A curator,
+Both ⁂ asngn and embedded ⁂ asper can borrow the same `asmodel_manager`. A curator,
 an embedder and an answer generator therefore share one residency policy rather
 than independently loading whatever they need.
 
-## 3. What asmodel owns
+## 3. What ⁂ asmodel owns
 
 The runtime is responsible for:
 
@@ -44,7 +49,7 @@ The runtime is responsible for:
 - propagating progress, cancellation, limits and transport failures precisely.
 
 It does not plan agent actions, build prompts, store conversations or execute
-tools. Those policies belong to asngn, Asper and astools.
+tools. Those policies belong to ⁂ asngn, ⁂ asper and ⁂ astools.
 
 ## 4. Runtime model
 
@@ -74,7 +79,7 @@ server, LM Studio and vLLM differ in structured-output fields, reasoning
 controls, streaming details and cache reporting. Pretending they are identical
 creates silent quality failures.
 
-`asmodel` therefore uses explicit remote profiles:
+⁂ asmodel therefore uses explicit remote profiles:
 
 | Profile | Structured output | Reasoning control | Prompt reuse |
 |---|---|---|---|
@@ -120,7 +125,7 @@ when the provider reports them.
 ## 7. Performance strategy
 
 The most expensive local-model operations are weight loading, memory transfer,
-prompt ingestion and repeated prefix evaluation. asmodel attacks those costs at
+prompt ingestion and repeated prefix evaluation. ⁂ asmodel attacks those costs at
 their source:
 
 - **Shared residency:** one loaded instance serves all borrowing components.
@@ -154,7 +159,7 @@ answers or weakening prompts.
   remaining available to tasks that benefit from it.
 - Partial output is returned at limits, allowing continuation instead of a full
   retry.
-- Exact usage and finish metadata let asngn measure savings and detect a genuine
+- Exact usage and finish metadata let ⁂ asngn measure savings and detect a genuine
   budget problem instead of guessing.
 
 No automatic fallback is allowed to trade away a required constraint. Saving
@@ -163,7 +168,7 @@ tokens is valid only when the observable task contract remains intact.
 ## 9. How this helps small language models
 
 Small language models are especially sensitive to prompt noise, ambiguous
-output formats and limited compute. asmodel improves their effective ability by
+output formats and limited compute. ⁂ asmodel improves their effective ability by
 making the inference environment predictable:
 
 - grammar-constrained outputs remove invalid action syntax from the search
@@ -221,8 +226,8 @@ they must not broaden the generic profile by assumption.
 
 Callers supply `output_schema` explicitly alongside any alternative free GBNF.
 The provider chooses a supported encoding and reports `json_output`; it does not
-infer semantics from grammar text or normalize application objects. Asngn owns
-its action/classification/judge contracts. Asper owns curation/review/recall
-contracts. Tool argument schemas come from Astools' typed manifests. Complete
+infer semantics from grammar text or normalize application objects. ⁂ asngn owns
+its action/classification/judge contracts. ⁂ asper owns curation/review/recall
+contracts. Tool argument schemas come from ⁂ astools' typed manifests. Complete
 JSON values are validated at their owning application boundary. Multimodal
 messages and native tool-call history remain future parts of the request IR.

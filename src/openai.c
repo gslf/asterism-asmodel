@@ -108,6 +108,21 @@ static int curl_progress(void *ud, curl_off_t a, curl_off_t b,
 }
 #endif
 
+#if defined(_WIN32) && !defined(ASMODEL_WITH_CURL)
+/* WinHTTP timeouts apply to individual operations, not the whole response.
+ * Reuse the remaining budget and reject bytes received after its deadline. */
+static int winhttp_budget(HINTERNET handle, int64_t started, int64_t deadline_ms) {
+  if (deadline_ms <= 0) return 1;
+  int64_t remaining = deadline_ms - (mono_ms() - started);
+  if (remaining <= 0) {
+    SetLastError(ERROR_WINHTTP_TIMEOUT);
+    return 0;
+  }
+  int timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+  return WinHttpSetTimeouts(handle, timeout, timeout, timeout, timeout) != 0;
+}
+#endif
+
 static int endpoint(const char *base, const char *suffix, char **out) {
   size_t n = strlen(base), m = strlen(suffix);
   int slash = n > 0 && base[n - 1] == '/';
@@ -199,6 +214,7 @@ done:
   const char *key = NULL;
   DWORD status = 0, status_size = sizeof status, available = 0;
   int rc = -1, wn;
+  int64_t started = mono_ms();
   size_t body_len = strlen(body);
   if (endpoint(u->base_url, suffix, &url)) goto done;
   wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, url, -1, NULL, 0);
@@ -220,8 +236,8 @@ done:
                               ? (deadline_ms > INT_MAX ? INT_MAX
                                                        : (int)deadline_ms)
                               : 0;
-    WinHttpSetTimeouts(session, 10000, 10000,
-                       request_timeout, request_timeout);
+    if (!WinHttpSetTimeouts(session, 10000, 10000,
+                            request_timeout, request_timeout)) goto done;
   }
   {
     wchar_t *host = (wchar_t *)malloc(((size_t)parts.dwHostNameLength + 1) *
@@ -274,9 +290,12 @@ done:
     free(auth.p); headers = wauth;
   } else headers = L"Content-Type: application/json";
   if (body_len > 0xffffffffu) goto done;
-  if (!WinHttpSendRequest(request, headers, (DWORD)-1L, (void *)body,
+  if (!winhttp_budget(request, started, deadline_ms) ||
+      !WinHttpSendRequest(request, headers, (DWORD)-1L, (void *)body,
                           (DWORD)body_len, (DWORD)body_len, 0) ||
-      !WinHttpReceiveResponse(request, NULL)) goto done;
+      !winhttp_budget(request, started, deadline_ms) ||
+      !WinHttpReceiveResponse(request, NULL) ||
+      !winhttp_budget(request, started, deadline_ms)) goto done;
   if (!WinHttpQueryHeaders(request,
                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
@@ -285,11 +304,14 @@ done:
     char *chunk;
     DWORD got = 0;
     if (cancel && *cancel) goto done;
-    if (!WinHttpQueryDataAvailable(request, &available)) goto done;
+    if (!winhttp_budget(request, started, deadline_ms) ||
+        !WinHttpQueryDataAvailable(request, &available) ||
+        !winhttp_budget(request, started, deadline_ms)) goto done;
     if (!available) break;
     chunk = (char *)malloc(available);
     if (!chunk) goto done;
     if (!WinHttpReadData(request, chunk, available, &got) ||
+        !winhttp_budget(request, started, deadline_ms) ||
         putn(reply, chunk, got)) { free(chunk); goto done; }
     if (got > 0 && progress_fn) progress_fn("", 0, progress_ud);
     free(chunk);
@@ -301,7 +323,8 @@ done:
 done:
   if (rc != 0 && error && error_size && !error[0]) {
     DWORD winerr = GetLastError();
-    if (winerr == ERROR_WINHTTP_TIMEOUT && deadline_ms > 0) {
+    if (deadline_ms > 0 && (winerr == ERROR_WINHTTP_TIMEOUT ||
+                            mono_ms() - started >= deadline_ms)) {
       snprintf(error, error_size,
                "inference deadline expired after %lld ms",
                (long long)deadline_ms);

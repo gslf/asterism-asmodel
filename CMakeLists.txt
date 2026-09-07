@@ -4,6 +4,10 @@ project(asmodel C)
 option(ASMODEL_BUILD_TESTS "Build asmodel tests" ON)
 option(ASMODEL_BUILD_FUZZERS "Build Clang libFuzzer parser targets" OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if(MSVC)
+  # Tests contain UTF-8 protocol fixtures just like the library.
+  add_compile_options(/utf-8)
+endif()
 
 find_package(CURL QUIET)
 add_library(asmodel_obj OBJECT src/asmodel.c src/input.c src/input_json.c src/tools.c src/tool_decode.c src/openai.c src/openai_decode.c src/tokens.c src/pipeline.c
@@ -103,6 +107,7 @@ if(ASMODEL_BUILD_TESTS)
       add_test(NAME asmodel-openai
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_openai.py
                 $<TARGET_FILE:asmodel-openai-smoke>)
+      set_tests_properties(asmodel-openai PROPERTIES TIMEOUT 60)
     endif()
   endif()
 endif()

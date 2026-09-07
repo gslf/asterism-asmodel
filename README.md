@@ -1,6 +1,12 @@
-# asmodel
+# ⁂ asmodel
 
-`asmodel` is the process-wide model runtime for Asterism components. It owns
+### Shared inference and model-resource subsystem 
+
+>⁂ asterism is a modular agent harness that turns language models into tools for creating and completing real-world workflows and automations. **SLM** and **local inference** friendly. Read the central [architecture decisions and system value](https://github.com/gslf/asterism-asngn/blob/main/docs/ARCHITECTURE.md).
+
+
+
+⁂ asmodel is the process-wide model runtime for ⁂ asterism components. It owns
 loaded provider instances and their reusable contexts, applies resident/RAM/
 VRAM budgets, performs ordered warm-up and LRU/idle eviction, and exposes one
 API for generation, embeddings, tokenization and context/KV reuse.
@@ -142,3 +148,6 @@ unknown. Transport progress callbacks may carry an empty fragment.
 Queue time and request preparation consume the same deadline as inference.
 Native synchronous loading and Windows HTTP cancellation remain backend limits.
 Protocol mock tests exercise contracts, not real-model capability conformance.
+
+## License
+MIT [LICENSE](LICENSE).

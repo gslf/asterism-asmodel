@@ -103,21 +103,27 @@ int main(int argc, char **argv) {
     return 18;
   params.deadline_ms = 20;
   text = NULL;
-  if (timeout_provider.generate(timeout_provider.userdata, TEXT_INPUT("system","user"),
+  int timeout_rc = timeout_provider.generate(timeout_provider.userdata, TEXT_INPUT("system","user"),
                                 NULL, &params, NULL, NULL, NULL, &text,
-                                &prompt_tokens, &generated_tokens) !=
-          ASMODEL_ERR_TIMEOUT || text != NULL ||
-      strstr(info.error,
-             "inference deadline expired") == NULL)
+                                &prompt_tokens, &generated_tokens);
+  if (timeout_rc != ASMODEL_ERR_TIMEOUT || text != NULL ||
+      strstr(info.error, "inference deadline expired") == NULL) {
+    fprintf(stderr, "timeout: status=%d text=%s error=%s\n", timeout_rc,
+            text ? text : "(null)", info.error);
     return 19;
+  }
   timeout_provider.destroy(timeout_provider.userdata);
   spec.remote_model = "partial-timeout-model";
   if (asmodel_openai_provider_create(&spec,&timeout_provider,error,sizeof error)) return 27;
   params.deadline_ms = 50;
-  if (timeout_provider.generate(timeout_provider.userdata,TEXT_INPUT("system","user"),NULL,&params,
-      NULL,NULL,NULL,&text,&prompt_tokens,&generated_tokens) != ASMODEL_ERR_TIMEOUT ||
-      !text || strcmp(text,"kept chunk") || info.usage_known || info.finish_reason != ASMODEL_FINISH_ERROR)
+  timeout_rc = timeout_provider.generate(timeout_provider.userdata,TEXT_INPUT("system","user"),NULL,&params,
+      NULL,NULL,NULL,&text,&prompt_tokens,&generated_tokens);
+  if (timeout_rc != ASMODEL_ERR_TIMEOUT || !text || strcmp(text,"kept chunk") ||
+      info.usage_known || info.finish_reason != ASMODEL_FINISH_ERROR) {
+    fprintf(stderr, "partial timeout: status=%d text=%s usage=%d finish=%d error=%s\n",
+            timeout_rc, text ? text : "(null)", info.usage_known, info.finish_reason, info.error);
     return 28;
+  }
   free(text); text = NULL;
   volatile int cancelled = 1;
   if (timeout_provider.generate(timeout_provider.userdata,TEXT_INPUT("system","user"),NULL,&params,
